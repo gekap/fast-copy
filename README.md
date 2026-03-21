@@ -181,3 +181,12 @@ sys     0m9.092s
 - **64 MB I/O buffers** — Large buffers keep the disk busy and reduce syscall overhead.
 - **Cross-platform** — Works on Linux, macOS, and Windows with platform-specific optimizations for physical layout detection.
 - **Standalone binary** — Build with PyInstaller for a single-file executable with no Python dependency.
+
+## Support
+
+If you find this tool useful, consider a donation:
+
+| Currency | Address |
+|----------|---------|
+| **USDC** (ERC-20) | `0xca8a1223300ab7fff6de983d642b96084305cccb` |
+| **ETH** (ERC-20) | `0xca8a1223300ab7fff6de983d642b96084305cccb` |

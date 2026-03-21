@@ -1,8 +1,19 @@
-# fast-copy
+# fast-copy — High-Speed File Copier with Deduplication and Block-Order I/O
 
-High-speed file copier that reads in physical disk order, deduplicates via content hashing, bundles small files into a single block stream, and hard-links duplicates — designed to max out sequential throughput on USB and external drives.
+A fast, cross-platform command-line tool to copy large folder trees at maximum sequential disk speed. Reads files in physical disk order, deduplicates identical files via content hashing (xxHash/MD5), bundles thousands of small files into a single block stream, and hard-links duplicates — drastically faster than `cp`, `robocopy`, or drag-and-drop for USB drives, external HDDs, NAS backups, and large file transfers.
 
-Works on **Linux**, **macOS**, and **Windows**.
+Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.8+ (or use the standalone binary).
+
+## Why fast-copy?
+
+| Problem | How fast-copy solves it |
+|---------|----------------------|
+| `cp -r` is slow on HDDs due to random seeks | Reads files in **physical disk order** for sequential throughput |
+| Copying thousands of small files is painfully slow | **Bundles small files** into a single block stream write |
+| Duplicate files waste space and time | **Content-aware dedup** — copies each unique file once, hard-links the rest |
+| No idea if the USB has enough space until it fails mid-copy | **Pre-flight space check** before any data is written |
+| Silent corruption on cheap USB drives | **Post-copy verification** hashes every file to confirm integrity |
+| Need it on multiple OSes | **Cross-platform** — Linux, macOS, Windows with native I/O optimizations |
 
 ## How it works
 

@@ -58,10 +58,10 @@ options:
 
 ```bash
 # Linux / macOS
-python fast_copy.py /home/kai/languages-app /mnt/usb/languages-app
+python fast_copy.py /home/kai/my-app /mnt/usb/my-app
 
 # Windows
-python fast_copy.py "C:\Projects\languages-app" "E:\Backup\languages-app"
+python fast_copy.py "C:\Projects\my-app" "E:\Backup\my-app"
 ```
 
 ### Dry run (preview without copying)
@@ -85,14 +85,14 @@ python fast_copy.py /home/user/project /mnt/usb/project --exclude node_modules -
 ## Example output
 
 ```
-$ time python fast_copy.py /home/kai/languages-app /mnt/folders/languages-app/
+$ time python fast_copy.py /home/kai/my-app /mnt/folders/my-app/
 
 ────────────────────────────────────────────────────────────
   FAST BLOCK-ORDER COPY
 ────────────────────────────────────────────────────────────
 
-  Source:      /home/kai/languages-app
-  Destination: /mnt/folders/languages-app
+  Source:      /home/kai/my-app
+  Destination: /mnt/folders/my-app
   Buffer:      64 MB
   Dedup:       enabled
   Platform:    Linux

@@ -696,7 +696,7 @@ def split_by_size(entries):
     return small, large
 
 
-def copy_block_stream(small_entries, dst_root, progress):
+def copy_block_stream(small_entries, dst_root, progress, cancel_check=None):
     """
     TRUE BLOCK-LEVEL WRITE for small files:
       1. Read all small files in physical disk order (sequential source reads)
@@ -724,6 +724,8 @@ def copy_block_stream(small_entries, dst_root, progress):
     try:
         with tarfile.open(tar_path, "w") as tar:
             for entry in small_entries:
+                if cancel_check and cancel_check():
+                    break
                 try:
                     # Read file into memory (it's small, fits easily)
                     with open(entry.src, "rb") as f:
@@ -757,7 +759,7 @@ def copy_block_stream(small_entries, dst_root, progress):
             os.remove(tar_path)
         print(f"  {C.YELLOW}Falling back to file-by-file copy...{C.RESET}")
         copy_individual(small_entries, dst_root, progress,
-                        bytearray(DEFAULT_BUFFER_MB * 1024 * 1024))
+                        bytearray(DEFAULT_BUFFER_MB * 1024 * 1024), cancel_check)
         return
 
     # ── Step 2: Extract tar locally on USB (per-file, skip errors) ──
@@ -810,11 +812,15 @@ def copy_block_stream(small_entries, dst_root, progress):
         print(f"  {C.YELLOW}Note: Could not remove bundle {TAR_BUNDLE_NAME} — delete manually{C.RESET}")
 
 
-def copy_individual(entries, dst_root, progress, buf):
+def copy_individual(entries, dst_root, progress, buf, cancel_check=None):
     """Copy large files individually with big buffers in physical disk order."""
     mv = memoryview(buf)
 
     for entry in entries:
+        # Check for cancellation between files
+        if cancel_check and cancel_check():
+            return
+
         dst_path = os.path.join(dst_root, entry.rel)
         dst_dir = os.path.dirname(dst_path)
 
@@ -829,6 +835,9 @@ def copy_individual(entries, dst_root, progress, buf):
 
             with open(entry.src, "rb") as fin, open(dst_path, "wb") as fout:
                 while True:
+                    # Check for cancellation during large file copy
+                    if cancel_check and cancel_check():
+                        return
                     n = fin.readinto(buf)
                     if not n:
                         break
@@ -850,7 +859,7 @@ def copy_individual(entries, dst_root, progress, buf):
             progress.update(entry.size, 1)
 
 
-def copy_hybrid(entries, dst_root, progress, buf_size):
+def copy_hybrid(entries, dst_root, progress, buf_size, cancel_check=None):
     """
     Hybrid block copy engine:
       - Small files (<1MB): bundled into tar → single block write → extract
@@ -871,13 +880,15 @@ def copy_hybrid(entries, dst_root, progress, buf_size):
     if large:
         print(f"  {C.BOLD}── Large files ──{C.RESET}")
         buf = bytearray(buf_size)
-        copy_individual(large, dst_root, progress, buf)
+        copy_individual(large, dst_root, progress, buf, cancel_check)
+        if cancel_check and cancel_check():
+            return
         print()
 
     # Block-stream small files
     if small:
         print(f"  {C.BOLD}── Small files (block stream) ──{C.RESET}")
-        copy_block_stream(small, dst_root, progress)
+        copy_block_stream(small, dst_root, progress, cancel_check)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1187,4 +1198,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

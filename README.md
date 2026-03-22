@@ -27,6 +27,25 @@ Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.
 
 After copying, all files are verified against their source hashes.
 
+## GUI
+
+fast-copy includes a **browser-based graphical interface** — no extra dependencies required. It launches a local web server and opens a dark-themed UI in your default browser.
+
+```bash
+python fast_copy_gui.py              # opens GUI on port 8787
+python fast_copy_gui.py --port 9090  # custom port
+```
+
+The GUI provides:
+
+- **Folder browser** — pick source and destination directories without typing paths
+- **All CLI options** — dedup, overwrite, verify, dry run, buffer size, threads, and exclude patterns
+- **Live progress** — real-time progress bar, speed, ETA, bytes copied, and phase indicator
+- **Log stream** — scrolling log of every phase as it runs
+- **Cancel** — stop a running copy at any time
+- **Completion summary** — files copied, linked, skipped, data written, time, and speed
+- **Donate button** — one-click access to crypto donation addresses (USDC/ETH) with copy-to-clipboard
+
 ## Installation
 
 ```bash
@@ -192,6 +211,7 @@ sys     0m9.092s
 - **64 MB I/O buffers** — Large buffers keep the disk busy and reduce syscall overhead.
 - **Cross-platform** — Works on Linux, macOS, and Windows with platform-specific optimizations for physical layout detection.
 - **Standalone binary** — Build with PyInstaller for a single-file executable with no Python dependency.
+- **Browser-based GUI** — Dark-themed web UI with folder browser, live progress, and all CLI options — no extra dependencies.
 
 ## Support
 

@@ -185,6 +185,15 @@ def run_copy(src, dst, buffer_mb, threads, dedup, overwrite, dry_run, excludes):
             state.running = False
             return
 
+        # Open dedup database
+        dedup_db = None
+        if dedup:
+            os.makedirs(dst, exist_ok=True)
+            try:
+                dedup_db = fc.DedupDB(dst)
+            except Exception:
+                pass
+
         # Phase 2: Dedup
         link_map = {}
         saved_bytes = 0
@@ -193,7 +202,7 @@ def run_copy(src, dst, buffer_mb, threads, dedup, overwrite, dry_run, excludes):
         if dedup:
             state.phase = "dedup"
             state.add_log("Phase 2 — Deduplication...")
-            copy_entries, link_map, saved_bytes = fc.deduplicate(entries, threads)
+            copy_entries, link_map, saved_bytes = fc.deduplicate(entries, threads, dedup_db)
             state.add_log(f"Unique: {len(copy_entries)}, Duplicates: {len(link_map)}, "
                           f"Saved: {fc.fmt_size(saved_bytes)}")
 
@@ -339,6 +348,16 @@ def run_copy(src, dst, buffer_mb, threads, dedup, overwrite, dry_run, excludes):
             state.add_log(f"Creating {len(link_map)} links...")
             fc.create_links(link_map, dst)
 
+        # Update dedup database with copied files
+        if dedup_db:
+            dst_rows = []
+            for e in copy_entries:
+                if not e.content_hash:
+                    continue  # skip unhashed — cached on next run
+                dst_rows.append((e.rel, e.size, e.content_hash))
+            if dst_rows:
+                dedup_db.store_dest_batch(dst_rows)
+
         elapsed = time.time() - t0
         speed = unique_size / elapsed if elapsed > 0 else 0
 
@@ -362,6 +381,11 @@ def run_copy(src, dst, buffer_mb, threads, dedup, overwrite, dry_run, excludes):
         state.result = {"status": "error", "message": str(e)}
         state.add_log(f"Error: {e}")
     finally:
+        if dedup_db:
+            try:
+                dedup_db.close()
+            except Exception:
+                pass
         state.running = False
 
 

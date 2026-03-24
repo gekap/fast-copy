@@ -7,6 +7,9 @@ Features:
   • Pre-flight space check (compares source size vs USB free space)
   • Content-aware deduplication (hashes files, copies each unique file once,
     hard-links duplicates — like Dell's backup dedup)
+  • Cross-run dedup database (SQLite cache at destination — skips re-hashing
+    unchanged files, detects content already on destination from prior runs)
+  • Strong hashing (xxh128 / SHA-256 fallback) for collision safety
   • Large I/O buffers (64MB default)
   • Post-copy verification
 
@@ -25,6 +28,7 @@ Options:
   --dry-run       Show copy plan without copying
   --no-verify     Skip post-copy verification
   --no-dedup      Disable deduplication (copy all files even if identical)
+  --no-cache      Disable persistent hash cache (cross-run dedup database)
   --force         Skip space check and copy anyway
 
 Build standalone executable:
@@ -42,6 +46,8 @@ import shutil
 import hashlib
 import tarfile
 import io
+import json
+import sqlite3
 import argparse
 import platform
 import threading
@@ -55,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DEFAULT_BUFFER_MB = 64
 DEFAULT_THREADS = 4
 HASH_CHUNK = 1 * 1024 * 1024   # 1MB chunks for hashing
-HASH_ALGO = "xxh64"             # try xxhash first, fallback to md5
+HASH_ALGO = "xxh128"            # try xxhash first, fallback to sha256
 
 FileEntry = namedtuple("FileEntry", ["src", "rel", "size", "physical_offset", "content_hash"])
 
@@ -104,17 +110,17 @@ def banner(msg):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# HASHING — use xxhash if available (10x faster), fallback to md5
+# HASHING — use xxhash if available (10x faster), fallback to sha256
 # ════════════════════════════════════════════════════════════════════════════
 try:
     import xxhash
     def new_hasher():
-        return xxhash.xxh64()
-    _hash_name = "xxh64"
+        return xxhash.xxh128()
+    _hash_name = "xxh128"
 except ImportError:
     def new_hasher():
-        return hashlib.md5()
-    _hash_name = "md5"
+        return hashlib.sha256()
+    _hash_name = "sha256"
 
 
 def hash_file(filepath, buf_size=HASH_CHUNK):
@@ -130,6 +136,140 @@ def hash_file(filepath, buf_size=HASH_CHUNK):
         return h.hexdigest()
     except OSError:
         return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DEDUP DATABASE — persistent hash cache across runs
+# ════════════════════════════════════════════════════════════════════════════
+DEDUP_DB_NAME = ".fast_copy_dedup.db"
+
+
+def _find_mount_point(path):
+    """Walk up from path to find the filesystem mount point."""
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+class DedupDB:
+    """
+    SQLite-backed hash cache stored at the mount/drive root.
+    Shared across all destinations on the same drive.
+
+    Two tables:
+      source_cache  — keyed on (source rel_path, size, mtime_ns)
+                      Speeds up hashing: same source file → same hash
+                      regardless of which destination subfolder you copy to.
+      dest_files    — keyed on mount-relative path
+                      Tracks what's actually on the drive for cross-run dedup.
+    """
+
+    def __init__(self, dst_root):
+        self.dst_root = os.path.realpath(dst_root)
+        self.mount = _find_mount_point(dst_root)
+        db_path = os.path.join(self.mount, DEDUP_DB_NAME)
+        self.db_path = db_path
+        # Prefix to convert dest-relative → mount-relative
+        self._prefix = os.path.relpath(self.dst_root, self.mount)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=OFF")  # cache is rebuildable
+        self.lock = threading.Lock()
+        self._init_schema()
+
+    def _mount_rel(self, rel_path):
+        """Convert destination-relative path to mount-relative path."""
+        return os.path.join(self._prefix, rel_path)
+
+    def _init_schema(self):
+        c = self.conn.cursor()
+        # Source hash cache — shared across all destination folders
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS source_cache (
+                rel_path    TEXT NOT NULL,
+                size        INTEGER NOT NULL,
+                mtime_ns    INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                hash_algo   TEXT NOT NULL,
+                PRIMARY KEY (rel_path, hash_algo)
+            )
+        """)
+        # Destination file index — tracks files on the drive
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS dest_files (
+                mount_rel   TEXT PRIMARY KEY,
+                size        INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                hash_algo   TEXT NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dest_hash
+            ON dest_files (content_hash)
+        """)
+        # Migrate old single-table schema if present
+        try:
+            c.execute("SELECT 1 FROM file_hashes LIMIT 1")
+            c.execute("DROP TABLE file_hashes")
+        except sqlite3.OperationalError:
+            pass
+        self.conn.commit()
+
+    # ── Source cache (hash speedup) ───────────────────────────────
+
+    def lookup(self, rel_path, size, mtime_ns):
+        """Return cached hash if source file size+mtime match, else None."""
+        with self.lock:
+            c = self.conn.cursor()
+            c.execute(
+                "SELECT content_hash FROM source_cache "
+                "WHERE rel_path = ? AND size = ? AND mtime_ns = ? AND hash_algo = ?",
+                (rel_path, size, mtime_ns, _hash_name),
+            )
+            row = c.fetchone()
+            return row[0] if row else None
+
+    def store_source_batch(self, rows):
+        """Cache source hashes. rows = list of (rel_path, size, mtime_ns, hash)."""
+        with self.lock:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO source_cache "
+                "(rel_path, size, mtime_ns, content_hash, hash_algo) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(r[0], r[1], r[2], r[3], _hash_name) for r in rows],
+            )
+            self.conn.commit()
+
+    # ── Destination index (cross-run dedup) ───────────────────────
+
+    def store_dest_batch(self, rows):
+        """Record files on the drive. rows = list of (rel_path, size, hash).
+        rel_path is destination-relative; stored as mount-relative."""
+        with self.lock:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO dest_files "
+                "(mount_rel, size, content_hash, hash_algo) "
+                "VALUES (?, ?, ?, ?)",
+                [(self._mount_rel(r[0]), r[1], r[2], _hash_name) for r in rows],
+            )
+            self.conn.commit()
+
+    def lookup_by_hash(self, content_hash):
+        """Find files on this drive with this hash.
+        Returns list of (mount_rel_path, size)."""
+        with self.lock:
+            c = self.conn.cursor()
+            c.execute(
+                "SELECT mount_rel, size FROM dest_files "
+                "WHERE content_hash = ? AND hash_algo = ?",
+                (content_hash, _hash_name),
+            )
+            return c.fetchall()
+
+    def close(self):
+        self.conn.commit()
+        self.conn.close()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -337,7 +477,7 @@ def scan_source(src_root, dst_root=None, excludes=None):
         print(f"\n  {C.YELLOW}Warning: Destination is inside source — it will be excluded{C.RESET}")
 
     # Compile exclude patterns
-    exclude_names = {TAR_BUNDLE_NAME}  # always skip our own tar bundle
+    exclude_names = {TAR_BUNDLE_NAME, DEDUP_DB_NAME}  # skip our own files
     if excludes:
         for ex in excludes:
             exclude_names.add(ex)
@@ -464,67 +604,81 @@ def resolve_physical_offsets(entries, threads=DEFAULT_THREADS):
 # ════════════════════════════════════════════════════════════════════════════
 # DEDUPLICATION
 # ════════════════════════════════════════════════════════════════════════════
-def deduplicate(entries, threads=DEFAULT_THREADS):
+def deduplicate(entries, threads=DEFAULT_THREADS, dedup_db=None):
     """
-    Content-aware deduplication (like Dell's backup):
-      1. Group files by size (files of different sizes can't be duplicates)
-      2. For same-size groups, hash file contents
-      3. Return (unique_entries, link_map) where link_map maps
-         duplicate rel paths → the rel path of the canonical copy
-
-    This means we only COPY each unique file once. Duplicates become
-    hard links on the destination, saving both time and space.
+    Content-aware deduplication:
+      1. Hash ALL files (using cache when available)
+      2. Group by (size, hash) — same-size pre-filter for within-run dedup
+      3. Cross-run dedup: check if drive already has matching content
+      4. Return (unique_entries, link_map)
     """
     print(f"  Using hash: {C.BOLD}{_hash_name}{C.RESET}")
+    if dedup_db:
+        print(f"  {C.DIM}Hash cache: enabled (cross-run dedup){C.RESET}")
 
-    # ── Step 1: Group by size (fast pre-filter) ───────────────────────
-    size_groups = defaultdict(list)
-    for e in entries:
-        size_groups[e.size].append(e)
+    # ── Step 1: Hash ALL files (cache-aware) ──────────────────────────
+    total = len(entries)
+    print(f"  Hashing {total} files...")
 
-    # Files with unique size: no possible duplicates
-    unique_entries = []
-    candidates = []  # same-size groups that need hashing
-
-    for sz, group in size_groups.items():
-        if len(group) == 1:
-            unique_entries.append(group[0])
-        else:
-            candidates.extend(group)
-
-    if not candidates:
-        print(f"  {C.GREEN}No potential duplicates (all files have unique sizes){C.RESET}")
-        return entries, {}, 0
-
-    print(f"  {len(candidates)} files in same-size groups need hashing...")
-
-    # ── Step 2: Hash candidates in parallel ───────────────────────────
-    hashes = [None] * len(candidates)
-
-    def do_hash(idx):
-        hashes[idx] = hash_file(candidates[idx].src)
-
+    hashes = [None] * total
+    cache_hits = [0]
+    new_hashes = []  # (rel, size, mtime_ns, hash) for source cache
     done_count = [0]
     lock = threading.Lock()
 
+    def do_hash(idx):
+        entry = entries[idx]
+        # Try cache first
+        if dedup_db:
+            try:
+                mtime_ns = os.stat(entry.src).st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            cached = dedup_db.lookup(entry.rel, entry.size, mtime_ns)
+            if cached:
+                hashes[idx] = cached
+                with lock:
+                    cache_hits[0] += 1
+                return
+        # Cache miss — hash the file
+        h = hash_file(entry.src)
+        hashes[idx] = h
+        if dedup_db and h is not None:
+            try:
+                mtime_ns = os.stat(entry.src).st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            with lock:
+                new_hashes.append((entry.rel, entry.size, mtime_ns, h))
+
     with ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(do_hash, i) for i in range(len(candidates))]
+        futures = [pool.submit(do_hash, i) for i in range(total)]
         for f in as_completed(futures):
             f.result()
             with lock:
                 done_count[0] += 1
                 if done_count[0] % 200 == 0:
-                    print(f"\r  {C.DIM}Hashing... {done_count[0]}/{len(candidates)}{C.RESET}",
+                    print(f"\r  {C.DIM}Hashing... {done_count[0]}/{total}{C.RESET}",
                           end="", flush=True)
 
-    # Update entries with hashes
+    # Store newly computed hashes in source cache
+    if dedup_db and new_hashes:
+        dedup_db.store_source_batch(new_hashes)
+
+    if cache_hits[0] > 0:
+        print(f"\r  {C.GREEN}Cache: {cache_hits[0]}/{total} hashes from DB "
+              f"({total - cache_hits[0]} computed){C.RESET}          ")
+
+    # Update all entries with hashes
     hashed_entries = [
         FileEntry(e.src, e.rel, e.size, e.physical_offset, hashes[i])
-        for i, e in enumerate(candidates)
+        for i, e in enumerate(entries)
     ]
 
-    # ── Step 3: Group by (size, hash) to find true duplicates ─────────
+    # ── Step 2: Group by (size, hash) to find duplicates ──────────────
     hash_groups = defaultdict(list)
+    unique_entries = []
+
     for e in hashed_entries:
         if e.content_hash is not None:
             key = (e.size, e.content_hash)
@@ -533,23 +687,58 @@ def deduplicate(entries, threads=DEFAULT_THREADS):
             # Couldn't hash → treat as unique
             unique_entries.append(e)
 
-    link_map = {}       # duplicate_rel → canonical_rel
+    link_map = {}       # duplicate_rel → canonical_rel or ("__abs__", path)
     saved_bytes = 0
+    crossrun_count = 0
+    crossrun_bytes = 0
+    crossrun_sources = defaultdict(int)  # folder → file count
 
     for key, group in hash_groups.items():
-        # First file is canonical (will be copied), rest are duplicates (will be linked)
         canonical = group[0]
-        unique_entries.append(canonical)
-        for dup in group[1:]:
-            link_map[dup.rel] = canonical.rel
-            saved_bytes += dup.size
+
+        # ── Cross-run dedup: check if drive already has this content ──
+        if dedup_db:
+            dst_matches = dedup_db.lookup_by_hash(key[1])  # key[1] = content_hash
+            for mount_rel, dst_size in dst_matches:
+                # mount_rel is relative to mount point, build full path
+                full_path = os.path.join(dedup_db.mount, mount_rel)
+                if dst_size == key[0] and os.path.isfile(full_path):
+                    # Drive already has a file with this content —
+                    # use it as link target (avoids copying entirely)
+                    canonical = None
+                    # Track which folder the match came from
+                    match_folder = mount_rel.split(os.sep)[0] if os.sep in mount_rel else mount_rel.split("/")[0]
+                    for e in group:
+                        link_map[e.rel] = ("__abs__", full_path)
+                        saved_bytes += e.size
+                        crossrun_count += 1
+                        crossrun_bytes += e.size
+                    crossrun_sources[match_folder] += len(group)
+                    break
+
+        if canonical is not None:
+            # Normal dedup: first file is canonical, rest are linked
+            unique_entries.append(canonical)
+            for dup in group[1:]:
+                link_map[dup.rel] = canonical.rel
+                saved_bytes += dup.size
 
     dup_count = len(link_map)
+    within_run = dup_count - crossrun_count
     total_files = len(entries)
 
     print(f"\r  {C.GREEN}Dedup complete:{C.RESET}                              ")
     print(f"    Unique files:    {C.BOLD}{len(unique_entries)}{C.RESET}")
-    print(f"    Duplicates:      {C.BOLD}{dup_count}{C.RESET} "
+    if within_run > 0:
+        print(f"    Within-run dups: {C.BOLD}{within_run}{C.RESET} files "
+              f"(identical files in source)")
+    if crossrun_count > 0:
+        print(f"    Cross-run dups:  {C.BOLD}{crossrun_count}{C.RESET} files "
+              f"({C.GREEN}{fmt_size(crossrun_bytes)}{C.RESET}) — "
+              f"already on drive, will link instead of copy")
+        for folder, count in sorted(crossrun_sources.items(), key=lambda x: -x[1]):
+            print(f"      → {C.CYAN}{folder}/{C.RESET}: {count} files matched")
+    print(f"    Total duplicates:{C.BOLD} {dup_count}{C.RESET} "
           f"({fmt_pct(dup_count, total_files)} of files)")
     print(f"    Space saved:     {C.GREEN}{C.BOLD}{fmt_size(saved_bytes)}{C.RESET} "
           f"({fmt_pct(saved_bytes, sum(e.size for e in entries))} reduction)")
@@ -572,9 +761,13 @@ def create_links(link_map, dst_root):
     copy_fallback = 0
     errors = 0
 
-    for dup_rel, canonical_rel in link_map.items():
+    for dup_rel, target in link_map.items():
         dst_dup = os.path.join(dst_root, dup_rel)
-        dst_canonical = os.path.join(dst_root, canonical_rel)
+        # Target is either a rel path or ("__abs__", full_path) for cross-run dedup
+        if isinstance(target, tuple) and target[0] == "__abs__":
+            dst_canonical = target[1]
+        else:
+            dst_canonical = os.path.join(dst_root, target)
 
         os.makedirs(os.path.dirname(dst_dup), exist_ok=True)
 
@@ -591,8 +784,14 @@ def create_links(link_map, dst_root):
             # Compute relative path from dup to canonical
             rel_target = os.path.relpath(dst_canonical, os.path.dirname(dst_dup))
             os.symlink(rel_target, dst_dup)
-            symlink_ok += 1
-            continue
+            # Verify the symlink actually resolves (NTFS via Linux creates
+            # symlinks that don't work)
+            if os.path.isfile(dst_dup):
+                symlink_ok += 1
+                continue
+            else:
+                # Broken symlink — remove and fall through to copy
+                os.unlink(dst_dup)
         except OSError:
             pass
 
@@ -895,28 +1094,40 @@ def copy_hybrid(entries, dst_root, progress, buf_size, cancel_check=None):
 # VERIFICATION
 # ════════════════════════════════════════════════════════════════════════════
 def verify_copy(entries, link_map, dst_root):
-    """Check existence + file size for all files (unique + linked)."""
-    print(f"\n  {C.DIM}Verifying...{C.RESET}", end="", flush=True)
+    """Check existence + file size for all files (unique + linked).
+    Uses a single os.walk pass instead of per-file stat calls."""
+    total_to_check = len(entries) + len(link_map)
+    print(f"\n  {C.DIM}Verifying {total_to_check} files...{C.RESET}", end="", flush=True)
+
+    # Build expected files: rel_path → expected_size (None = just check exists)
+    expected = {}
+    for entry in entries:
+        expected[entry.rel] = entry.size
+    for dup_rel in link_map:
+        expected[dup_rel] = None  # links: just check existence
+
+    # Single walk of destination — much faster than per-file stat on USB
+    found = {}
+    for root, dirs, files in os.walk(dst_root):
+        for fname in files:
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, dst_root)
+            if rel in expected:
+                try:
+                    found[rel] = os.path.getsize(full)
+                except OSError:
+                    pass
+
     mismatches = []
     missing = []
+    for rel, exp_size in expected.items():
+        if rel not in found:
+            tag = " (link)" if exp_size is None else ""
+            missing.append(f"{rel}{tag}")
+        elif exp_size is not None and found[rel] != exp_size:
+            mismatches.append((rel, exp_size, found[rel]))
 
-    # Verify unique files
-    for entry in entries:
-        dst_path = os.path.join(dst_root, entry.rel)
-        if not os.path.exists(dst_path):
-            missing.append(entry.rel)
-            continue
-        dst_size = os.path.getsize(dst_path)
-        if dst_size != entry.size:
-            mismatches.append((entry.rel, entry.size, dst_size))
-
-    # Verify linked duplicates exist
-    for dup_rel in link_map:
-        dst_path = os.path.join(dst_root, dup_rel)
-        if not os.path.exists(dst_path):
-            missing.append(f"{dup_rel} (link)")
-
-    total_checked = len(entries) + len(link_map)
+    total_checked = len(expected)
 
     if not missing and not mismatches:
         print(f"\r  {C.GREEN}✓ Verified: all {total_checked} files OK{C.RESET}               ")
@@ -1066,6 +1277,8 @@ def main():
                         help="Overwrite all files, skip identical-file detection")
     parser.add_argument("--exclude", action="append", default=[],
                         help="Exclude files/dirs by name (can use multiple times)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable persistent hash cache (cross-run dedup database)")
     args = parser.parse_args()
 
     src = os.path.abspath(args.source)
@@ -1081,6 +1294,7 @@ def main():
     print(f"  Destination: {C.BOLD}{dst}{C.RESET}")
     print(f"  Buffer:      {args.buffer} MB")
     print(f"  Dedup:       {'disabled' if args.no_dedup else 'enabled'}")
+    print(f"  Hash cache:  {'disabled' if args.no_cache else 'enabled'}")
     print(f"  Overwrite:   {'always' if args.overwrite else 'skip identical'}")
     print(f"  Platform:    {_system}")
     print()
@@ -1100,6 +1314,15 @@ def main():
           f"{C.BOLD}{total_files}{C.RESET} files  "
           f"(avg {fmt_size(avg_size)}/file)")
 
+    # ── Open dedup database ──────────────────────────────────────────
+    dedup_db = None
+    if not args.no_dedup and not args.no_cache:
+        os.makedirs(dst, exist_ok=True)
+        try:
+            dedup_db = DedupDB(dst)
+        except Exception as e:
+            print(f"  {C.YELLOW}Warning: could not open hash cache: {e}{C.RESET}")
+
     # ── Phase 2: Deduplication ────────────────────────────────────────
     link_map = {}
     saved_bytes = 0
@@ -1107,7 +1330,7 @@ def main():
 
     if not args.no_dedup:
         banner("Phase 2 — Deduplication")
-        copy_entries, link_map, saved_bytes = deduplicate(entries, args.threads)
+        copy_entries, link_map, saved_bytes = deduplicate(entries, args.threads, dedup_db)
 
     unique_size = sum(e.size for e in copy_entries)
 
@@ -1123,6 +1346,8 @@ def main():
         unique_size = sum(e.size for e in copy_entries)
 
         if not copy_entries and not link_map:
+            if dedup_db:
+                dedup_db.close()
             banner("DONE — Nothing to copy")
             print(f"  All {skipped_count} files are already up to date.")
             print()
@@ -1160,6 +1385,8 @@ def main():
         if link_map:
             print(f"\n  Plus {len(link_map)} duplicate files to be linked")
         print(f"\n  Unique data: {fmt_size(unique_size)}")
+        if dedup_db:
+            dedup_db.close()
         sys.exit(0)
 
     # ── Phase 5: Block copy ─────────────────────────────────────────
@@ -1177,6 +1404,17 @@ def main():
 
     elapsed = time.time() - t0
     speed = unique_size / elapsed if elapsed > 0 else 0
+
+    # ── Update dedup database with copied files ──────────────────────
+    if dedup_db:
+        dst_rows = []
+        for e in copy_entries:
+            if not e.content_hash:
+                continue  # skip unhashed files — will be cached on next run
+            dst_rows.append((e.rel, e.size, e.content_hash))
+        if dst_rows:
+            dedup_db.store_dest_batch(dst_rows)
+        dedup_db.close()
 
     # ── Verify ────────────────────────────────────────────────────────
     if not args.no_verify:

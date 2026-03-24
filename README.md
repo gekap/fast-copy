@@ -1,6 +1,6 @@
 # fast-copy — High-Speed File Copier with Deduplication and Block-Order I/O
 
-A fast, cross-platform command-line tool to copy large folder trees at maximum sequential disk speed. Reads files in physical disk order, deduplicates identical files via content hashing (xxHash/MD5), bundles thousands of small files into a single block stream, and hard-links duplicates — drastically faster than `cp`, `robocopy`, or drag-and-drop for USB drives, external HDDs, NAS backups, and large file transfers.
+A fast, cross-platform command-line tool to copy files and folders at maximum sequential disk speed. Reads files in physical disk order, deduplicates identical files via content hashing (xxh128/SHA-256), bundles thousands of small files into a single block stream, and hard-links duplicates — drastically faster than `cp`, `robocopy`, or drag-and-drop for USB drives, external HDDs, NAS backups, and large file transfers. Supports directories, single files, and glob/wildcard patterns.
 
 Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.8+ (or use the standalone binary).
 
@@ -27,25 +27,6 @@ Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.
 
 After copying, all files are verified against their source hashes.
 
-## GUI
-
-fast-copy includes a **browser-based graphical interface** — no extra dependencies required. It launches a local web server and opens a dark-themed UI in your default browser.
-
-```bash
-python fast_copy_gui.py              # opens GUI on port 8787
-python fast_copy_gui.py --port 9090  # custom port
-```
-
-The GUI provides:
-
-- **Folder browser** — pick source and destination directories without typing paths
-- **All CLI options** — dedup, overwrite, verify, dry run, buffer size, threads, and exclude patterns
-- **Live progress** — real-time progress bar, speed, ETA, bytes copied, and phase indicator
-- **Log stream** — scrolling log of every phase as it runs
-- **Cancel** — stop a running copy at any time
-- **Completion summary** — files copied, linked, skipped, data written, time, and speed
-- **Donate button** — one-click access to crypto donation addresses (USDC/ETH) with copy-to-clipboard
-
 ## Installation
 
 ```bash
@@ -62,12 +43,12 @@ python build.py
 
 ```
 usage: fast_copy.py [-h] [--buffer BUFFER] [--threads THREADS] [--dry-run]
-                    [--no-verify] [--no-dedup] [--force] [--overwrite]
-                    [--exclude EXCLUDE]
+                    [--no-verify] [--no-dedup] [--no-cache] [--force]
+                    [--overwrite] [--exclude EXCLUDE]
                     source destination
 
 positional arguments:
-  source             Source folder to copy
+  source             Source folder, file, or glob pattern (e.g. *.zip)
   destination        Destination (USB drive path, etc)
 
 options:
@@ -77,6 +58,7 @@ options:
   --dry-run          Show copy plan without copying
   --no-verify        Skip post-copy verification
   --no-dedup         Disable deduplication
+  --no-cache         Disable persistent hash cache (cross-run dedup database)
   --force            Skip space check, copy even if not enough space
   --overwrite        Overwrite all files, skip identical-file detection
   --exclude EXCLUDE  Exclude files/dirs by name (can use multiple times)
@@ -84,7 +66,7 @@ options:
 
 ## Examples
 
-### Copy a project folder to a USB drive
+### Copy a folder to a USB drive
 
 ```bash
 # Linux / macOS
@@ -92,6 +74,29 @@ python fast_copy.py /home/kai/my-app /mnt/usb/my-app
 
 # Windows
 python fast_copy.py "C:\Projects\my-app" "E:\Backup\my-app"
+```
+
+### Copy a single file
+
+```bash
+# Linux / macOS
+python fast_copy.py ~/Downloads/Rocky-10.0-x86_64-dvd1.iso /mnt/usb/
+
+# Windows
+python fast_copy.py "C:\Users\kai\Downloads\Rocky-10.0-x86_64-dvd1.iso" "D:\"
+```
+
+### Copy files matching a wildcard pattern
+
+```bash
+# All zip files
+python fast_copy.py "~/Downloads/*.zip" /mnt/usb/zips/
+
+# All ISO images (Windows)
+python fast_copy.py "C:\ISOs\*.iso" "E:\Backup\ISOs"
+
+# All log files
+python fast_copy.py "/var/log/*.log" /mnt/usb/logs/
 ```
 
 ### Dry run (preview without copying)
@@ -204,14 +209,15 @@ sys     0m9.092s
 ## Key features
 
 - **Block-order reads** — Files are read in physical disk order, eliminating random seeks on HDDs and improving throughput on SSDs.
-- **Content deduplication** — Identical files are detected by hash (xxHash when available, MD5 fallback). Each unique file is written once; duplicates become hard links, saving space and write time.
+- **Content deduplication** — Identical files are detected by hash (xxh128 when available, SHA-256 fallback). Each unique file is written once; duplicates become hard links, saving space and write time.
+- **Cross-run dedup database** — SQLite cache at the drive root remembers file hashes across runs. Copy the same source to a new folder? Zero bytes written — all files hard-linked to existing copies.
+- **Flexible source** — Copy a directory, a single file, or a glob pattern (`*.zip`, `*.iso`).
 - **Small-file block streaming** — Thousands of small files are bundled into a single sequential write, then extracted — avoids the overhead of creating files one by one.
 - **Pre-flight space check** — Verifies the destination has enough free space before writing, accounting for dedup savings.
-- **Post-copy verification** — Every copied file is re-hashed and compared against the source to guarantee integrity.
+- **Post-copy verification** — Every copied file is verified against the source to guarantee integrity.
 - **64 MB I/O buffers** — Large buffers keep the disk busy and reduce syscall overhead.
 - **Cross-platform** — Works on Linux, macOS, and Windows with platform-specific optimizations for physical layout detection.
 - **Standalone binary** — Build with PyInstaller for a single-file executable with no Python dependency.
-- **Browser-based GUI** — Dark-themed web UI with folder browser, live progress, and all CLI options — no extra dependencies.
 
 ## Support
 

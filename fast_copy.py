@@ -14,13 +14,18 @@ Features:
   • Post-copy verification
 
 Usage:
-  python fast_copy.py <source_folder> <usb_destination>
+  python fast_copy.py <source> <destination>
+
+  Source can be a folder, a single file, or a glob/wildcard pattern.
 
 Examples:
-  python fast_copy.py "C:\\Projects" "E:\\Backup\\Projects"
-  python fast_copy.py /home/user/data /media/usb/data
-  python fast_copy.py /data /mnt/usb --no-dedup          # skip dedup
-  python fast_copy.py /data /mnt/usb --force              # skip space check
+  python fast_copy.py "C:\\Projects" "E:\\Backup\\Projects"     # folder
+  python fast_copy.py /home/user/data /media/usb/data           # folder
+  python fast_copy.py ~/Downloads/file.iso /mnt/usb/            # single file
+  python fast_copy.py "~/Downloads/*.zip" /mnt/usb/zips/        # wildcard
+  python fast_copy.py "/data/logs/*.log" /mnt/usb/logs/         # glob
+  python fast_copy.py /data /mnt/usb --no-dedup                 # skip dedup
+  python fast_copy.py /data /mnt/usb --force                    # skip space check
 
 Options:
   --buffer MB     Read/write buffer size in MB (default: 64)
@@ -40,6 +45,7 @@ import os
 import sys
 import stat
 import time
+import glob as globmod
 import struct
 import ctypes
 import shutil
@@ -1259,7 +1265,7 @@ def main():
                     "disk order, deduplicates identical files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("source", help="Source folder to copy")
+    parser.add_argument("source", help="Source folder, file, or glob pattern (e.g. *.zip)")
     parser.add_argument("destination", help="Destination (USB drive path, etc)")
     parser.add_argument("--buffer", type=int, default=DEFAULT_BUFFER_MB,
                         help=f"Buffer size in MB (default: {DEFAULT_BUFFER_MB})")
@@ -1281,16 +1287,50 @@ def main():
                         help="Disable persistent hash cache (cross-run dedup database)")
     args = parser.parse_args()
 
-    src = os.path.abspath(args.source)
+    src_arg = args.source
     dst = os.path.abspath(args.destination)
     buf_size = args.buffer * 1024 * 1024
 
-    if not os.path.isdir(src):
-        print(f"{C.RED}Error: Source '{src}' is not a directory{C.RESET}")
-        sys.exit(1)
+    # ── Resolve source: directory, single file, or glob pattern ──────
+    src_mode = None  # "dir", "file", or "glob"
+    glob_files = []
+
+    src = os.path.abspath(src_arg)
+    if os.path.isdir(src):
+        src_mode = "dir"
+    elif os.path.isfile(src):
+        src_mode = "file"
+    else:
+        # Try glob expansion (handles wildcards like *.zip)
+        glob_files = sorted(globmod.glob(src_arg))
+        if not glob_files:
+            # Also try with abspath
+            glob_files = sorted(globmod.glob(src))
+        # Filter to files only
+        glob_files = [f for f in glob_files if os.path.isfile(f)]
+        if glob_files:
+            src_mode = "glob"
+        else:
+            print(f"{C.RED}Error: Source '{src_arg}' — no matching files or directory found{C.RESET}")
+            sys.exit(1)
+
+    if src_mode == "glob":
+        src_display = src_arg
+        # Use common parent as the "source root" for relative paths
+        src = os.path.commonpath([os.path.abspath(f) for f in glob_files])
+        if os.path.isfile(src):
+            src = os.path.dirname(src)
+    elif src_mode == "file":
+        src_display = src
+    else:
+        src_display = src
 
     banner("FAST BLOCK-ORDER COPY")
-    print(f"  Source:      {C.BOLD}{src}{C.RESET}")
+    print(f"  Source:      {C.BOLD}{src_display}{C.RESET}")
+    if src_mode == "glob":
+        print(f"               {C.DIM}{len(glob_files)} files matched{C.RESET}")
+    elif src_mode == "file":
+        print(f"               {C.DIM}(single file){C.RESET}")
     print(f"  Destination: {C.BOLD}{dst}{C.RESET}")
     print(f"  Buffer:      {args.buffer} MB")
     print(f"  Dedup:       {'disabled' if args.no_dedup else 'enabled'}")
@@ -1301,7 +1341,32 @@ def main():
 
     # ── Phase 1: Scan ─────────────────────────────────────────────────
     banner("Phase 1 — Scanning source")
-    entries, errors = scan_source(src, dst, args.exclude)
+
+    if src_mode == "file":
+        # Single file — build entry directly
+        fname = os.path.basename(src)
+        sz = os.path.getsize(src)
+        entries = [FileEntry(src=src, rel=fname, size=sz,
+                             physical_offset=0, content_hash=None)]
+        errors = []
+        print(f"  {C.GREEN}Found 1 file{C.RESET} ({fmt_size(sz)})")
+        src = os.path.dirname(src)  # parent becomes "source root" for dst layout
+    elif src_mode == "glob":
+        # Glob — build entries from matched files
+        entries = []
+        errors = []
+        for fpath in glob_files:
+            abs_f = os.path.abspath(fpath)
+            rel = os.path.relpath(abs_f, src)
+            try:
+                sz = os.path.getsize(abs_f)
+                entries.append(FileEntry(src=abs_f, rel=rel, size=sz,
+                                         physical_offset=0, content_hash=None))
+            except OSError as e:
+                errors.append((abs_f, str(e)))
+        print(f"  {C.GREEN}Found {len(entries)} files{C.RESET}")
+    else:
+        entries, errors = scan_source(src, dst, args.exclude)
 
     if not entries:
         print(f"  {C.YELLOW}No files found.{C.RESET}")

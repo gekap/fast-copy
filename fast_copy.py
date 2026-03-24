@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+# Copyright 2026 George Kapellakis
+# Licensed under the Apache License, Version 2.0
+# See LICENSE file for details.
 """
-FAST BLOCK-ORDER COPY — Copies folders at maximum sequential disk speed.
+FAST BLOCK-ORDER COPY — Copies files and folders at maximum sequential disk speed.
 
 Features:
   • Reads files in PHYSICAL disk order (eliminates random seeks)

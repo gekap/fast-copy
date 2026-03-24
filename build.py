@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Build script — compiles fast_copy into standalone executables.
+Build script — compiles fast_copy into a standalone executable.
 
 Usage:
-  python build.py              # build both CLI and GUI
-  python build.py cli          # build CLI only
-  python build.py gui          # build GUI only
+  python build.py              # build CLI executable
   python build.py --clean      # clean build artifacts first
 
 Output:
   dist/fast_copy       — CLI executable
-  dist/fast_copy_gui   — GUI executable (opens in browser)
 """
 
 import os
@@ -44,7 +41,7 @@ def install_deps():
                 ])
 
 
-def build_target(name, script, console=True):
+def build_target(name, script):
     """Build a single target with PyInstaller."""
     ext = ".exe" if platform.system() == "Windows" else ""
     out = f"{name}{ext}"
@@ -55,7 +52,7 @@ def build_target(name, script, console=True):
         "--name", name,
         "--clean",
         "--noupx",
-        "--console" if console else "--windowed",
+        "--console",
         "--hidden-import=xxhash",
         script,
     ]
@@ -78,19 +75,13 @@ def build_target(name, script, console=True):
 
 def main():
     clean = "--clean" in sys.argv
-    targets_arg = [a for a in sys.argv[1:] if not a.startswith("--")]
-    targets = targets_arg if targets_arg else ["cli", "gui"]
 
     print(f"Fast Copy Builder — {platform.system()} ({platform.machine()})")
     print(f"{'─' * 50}")
 
-    # Check source files exist
-    for script in ["fast_copy.py", "fast_copy_gui.py"]:
-        if not os.path.exists(script):
-            needed = "cli" if "fast_copy.py" == script else "gui"
-            if needed in targets:
-                print(f"  Error: {script} not found in current directory")
-                sys.exit(1)
+    if not os.path.exists("fast_copy.py"):
+        print("  Error: fast_copy.py not found in current directory")
+        sys.exit(1)
 
     # Install deps
     print("\nDependencies:")
@@ -107,26 +98,19 @@ def main():
         print("\nCleaned build artifacts.")
 
     # Build
-    print(f"\nBuilding targets: {', '.join(targets)}")
-
-    results = {}
-    if "cli" in targets:
-        results["cli"] = build_target("fast_copy", "fast_copy.py", console=True)
-    if "gui" in targets:
-        results["gui"] = build_target("fast_copy_gui", "fast_copy_gui.py", console=True)
+    print("\nBuilding CLI executable...")
+    success = build_target("fast_copy", "fast_copy.py")
 
     # Summary
     ext = ".exe" if platform.system() == "Windows" else ""
     print(f"\n{'─' * 50}")
-    print("Build complete:\n")
-
-    if results.get("cli"):
-        print(f"  CLI:  dist/fast_copy{ext}")
-        print(f'        fast_copy "C:\\Source" "E:\\Dest"')
-        print(f'        fast_copy /source /dest')
-    if results.get("gui"):
-        print(f"\n  GUI:  dist/fast_copy_gui{ext}")
-        print(f"        Double-click or run from terminal — opens in browser")
+    if success:
+        print(f"Build complete:\n")
+        print(f'  dist/fast_copy{ext}')
+        print(f'  Usage: fast_copy "C:\\Source" "E:\\Dest"')
+        print(f'         fast_copy /source /dest')
+    else:
+        print("Build failed.")
     print()
 
 

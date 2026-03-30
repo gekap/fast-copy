@@ -2,7 +2,7 @@
 
 A fast, cross-platform command-line tool to copy files and folders at maximum sequential disk speed. Reads files in physical disk order, deduplicates identical files via content hashing (xxh128/SHA-256), bundles thousands of small files into a single block stream, and hard-links duplicates — drastically faster than `cp`, `robocopy`, or drag-and-drop for USB drives, external HDDs, NAS backups, and large file transfers. Supports directories, single files, and glob/wildcard patterns.
 
-Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.8+ (or use the standalone binary).
+Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.8+ (or use the standalone binary). Optional xxHash support for ~10x faster hashing.
 
 ## Why fast-copy?
 
@@ -38,6 +38,44 @@ pip install pyinstaller
 python build.py
 ./dist/fast_copy <source> <destination>
 ```
+
+### Optional: Install xxHash for ~10x faster hashing
+
+fast-copy works out of the box with Python's built-in SHA-256, but installing xxHash makes the hashing phase dramatically faster. This matters most when copying large datasets or running deduplication.
+
+**Linux (Debian/Ubuntu)**
+```bash
+sudo apt install python3-xxhash
+```
+
+**Linux (Fedora/RHEL)**
+```bash
+sudo dnf install python3-xxhash
+```
+
+**Linux (Arch)**
+```bash
+sudo pacman -S python-xxhash
+```
+
+**macOS (Homebrew)**
+```bash
+brew install python-xxhash
+```
+
+**Windows**
+
+Download the matching `.whl` from [pypi.org/project/xxhash/#files](https://pypi.org/project/xxhash/#files) for your Python version and architecture, then install it:
+```powershell
+python -m pip install xxhash-X.X.X-cpXXX-cpXXX-win_amd64.whl
+```
+
+To verify it's installed:
+```bash
+python -c "import xxhash; print(xxhash.xxh128(b'test').hexdigest())"
+```
+
+If xxHash is not installed, fast-copy silently falls back to SHA-256 — no errors, just slower hashing.
 
 ## Usage
 

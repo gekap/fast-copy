@@ -182,6 +182,11 @@ class DedupDB:
         # Prefix to convert dest-relative → mount-relative
         self._prefix = os.path.relpath(self.dst_root, self.mount)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # Restrict DB file permissions to owner-only (contains file paths/hashes)
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            pass
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=OFF")  # cache is rebuildable
         self.lock = threading.Lock()
@@ -637,13 +642,16 @@ def deduplicate(entries, threads=DEFAULT_THREADS, dedup_db=None):
 
     def do_hash(idx):
         entry = entries[idx]
+        # Use full source path as cache key to avoid collisions when
+        # different files share the same basename (e.g. single-file mode)
+        cache_key = entry.src
         # Try cache first
         if dedup_db:
             try:
                 mtime_ns = os.stat(entry.src).st_mtime_ns
             except OSError:
                 mtime_ns = 0
-            cached = dedup_db.lookup(entry.rel, entry.size, mtime_ns)
+            cached = dedup_db.lookup(cache_key, entry.size, mtime_ns)
             if cached:
                 hashes[idx] = cached
                 with lock:
@@ -658,7 +666,7 @@ def deduplicate(entries, threads=DEFAULT_THREADS, dedup_db=None):
             except OSError:
                 mtime_ns = 0
             with lock:
-                new_hashes.append((entry.rel, entry.size, mtime_ns, h))
+                new_hashes.append((cache_key, entry.size, mtime_ns, h))
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
         futures = [pool.submit(do_hash, i) for i in range(total)]
@@ -980,6 +988,11 @@ def copy_block_stream(small_entries, dst_root, progress, cancel_check=None):
         with tarfile.open(tar_path, "r") as tar:
             for member in tar.getmembers():
                 try:
+                    # Validate member name to prevent path traversal
+                    if member.name.startswith('/') or '..' in member.name.split('/'):
+                        extract_errors.append((member.name, "blocked: unsafe path"))
+                        continue
+
                     dst_member = os.path.join(dst_root, member.name)
 
                     # If file exists with read-only perms (e.g. .git/objects),
@@ -1147,7 +1160,8 @@ def verify_copy(entries, link_map, dst_root):
             print(f"    {C.RED}MISSING: {m}{C.RESET}")
         for rel, exp, act in mismatches[:10]:
             print(f"    {C.RED}SIZE MISMATCH: {rel} ({exp} → {act}){C.RESET}")
-        remain = len(missing) + len(mismatches) - 10
+        shown = min(len(missing), 10) + min(len(mismatches), 10)
+        remain = len(missing) + len(mismatches) - shown
         if remain > 0:
             print(f"    ... and {remain} more")
         return False

@@ -3,11 +3,17 @@
 # Licensed under the Apache License, Version 2.0
 # See LICENSE file for details.
 """
-FAST BLOCK-ORDER COPY — Copies files and folders at maximum sequential disk speed.
+FAST BLOCK-ORDER COPY — Copies files and folders at maximum speed via SSH.
+
+Supports all four copy modes:
+  • local  → local   (block-order copy with dedup)
+  • local  → remote  (SFTP + tar stream to SSH server)
+  • remote → local   (SFTP + tar stream from SSH server)
+  • remote → remote  (relay through local machine: src SSH → dst SSH)
 
 Features:
   • Reads files in PHYSICAL disk order (eliminates random seeks)
-  • Pre-flight space check (compares source size vs USB free space)
+  • Pre-flight space check (compares source size vs destination free space)
   • Content-aware deduplication (hashes files, copies each unique file once,
     hard-links duplicates — like Dell's backup dedup)
   • Cross-run dedup database (SQLite cache at destination — skips re-hashing
@@ -15,33 +21,49 @@ Features:
   • Strong hashing (xxh128 / SHA-256 fallback) for collision safety
   • Large I/O buffers (64MB default)
   • Post-copy verification
+  • SSH remote support via paramiko (SFTP + tar streaming)
+  • Incremental sync — skips files already present and identical
+  • Small-file bundling via tar pipe for fast network transfers
 
 Usage:
   python fast_copy.py <source> <destination>
 
-  Source can be a folder, a single file, or a glob/wildcard pattern.
+  Source and destination can be local paths or remote SSH paths (user@host:/path).
 
 Examples:
-  python fast_copy.py "C:\\Projects" "E:\\Backup\\Projects"     # folder
-  python fast_copy.py /home/user/data /media/usb/data           # folder
-  python fast_copy.py ~/Downloads/file.iso /mnt/usb/            # single file
-  python fast_copy.py "~/Downloads/*.zip" /mnt/usb/zips/        # wildcard
-  python fast_copy.py "/data/logs/*.log" /mnt/usb/logs/         # glob
-  python fast_copy.py /data /mnt/usb --no-dedup                 # skip dedup
-  python fast_copy.py /data /mnt/usb --force                    # skip space check
+  # Local to local
+  python fast_copy.py /home/user/data /media/usb/data
+
+  # Local to remote
+  python fast_copy.py /data user@server:/backup/data
+
+  # Remote to local
+  python fast_copy.py user@server:/data /local/backup
+
+  # Remote to remote (relay through local machine)
+  python fast_copy.py user@src-host:/data user@dst-host:/backup/data
+
+  # With options
+  python fast_copy.py user@src:/data user@dst:/backup -z --no-dedup
+  python fast_copy.py user@host:/data /local --src-port 2222
 
 Options:
-  --buffer MB     Read/write buffer size in MB (default: 64)
-  --threads N     Threads for hashing & layout resolution (default: 4)
-  --dry-run       Show copy plan without copying
-  --no-verify     Skip post-copy verification
-  --no-dedup      Disable deduplication (copy all files even if identical)
-  --no-cache      Disable persistent hash cache (cross-run dedup database)
-  --force         Skip space check and copy anyway
+  --buffer MB       Read/write buffer size in MB (default: 64)
+  --threads N       Threads for hashing & layout resolution (default: 4)
+  --dry-run         Show copy plan without copying
+  --no-verify       Skip post-copy verification
+  --no-dedup        Disable deduplication (copy all files even if identical)
+  --no-cache        Disable persistent hash cache (cross-run dedup database)
+  --force           Skip space check and copy anyway
+  --ssh-dst-port PORT   SSH port for remote destination (default: 22)
+  --ssh-dst-key PATH    SSH private key for remote destination
+  --ssh-dst-password    Prompt for SSH password for destination
+  --ssh-src-port PORT   SSH port for remote source (default: 22)
+  --ssh-src-key PATH    SSH private key for remote source
+  --ssh-src-password    Prompt for SSH password for source
+  -z, --compress    Enable SSH compression (good for slow links)
 
-Build standalone executable:
-  pip install pyinstaller
-  pyinstaller --onefile --name fast_copy fast_copy.py
+Requires: pip install paramiko
 """
 
 import os
@@ -57,6 +79,11 @@ import tarfile
 import io
 import json
 import sqlite3
+import tempfile
+import re
+import getpass
+import posixpath
+import shlex
 import argparse
 import platform
 import threading
@@ -132,6 +159,9 @@ except ImportError:
     _hash_name = "sha256"
 
 
+_EMPTY_HASH = new_hasher().hexdigest()  # hash of zero bytes for active algorithm
+
+
 def hash_file(filepath, buf_size=HASH_CHUNK):
     """Hash file contents. Returns hex digest string."""
     h = new_hasher()
@@ -139,13 +169,73 @@ def hash_file(filepath, buf_size=HASH_CHUNK):
         with open(filepath, "rb") as f:
             chunk = f.read(buf_size)
             if not chunk:
-                return "e3b0c44298fc1c149afbf4c8996fb924"  # empty file sentinel
+                return _EMPTY_HASH
             while chunk:
                 h.update(chunk)
                 chunk = f.read(buf_size)
         return h.hexdigest()
     except OSError:
         return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PATH SAFETY — prevents path traversal attacks
+# ════════════════════════════════════════════════════════════════════════════
+def _validate_rel_path(rel):
+    """Check that a relative path is safe for tar inclusion. Returns True or error string."""
+    if not rel or rel.startswith('/') or os.path.isabs(rel):
+        return "absolute path"
+    for part in rel.replace('\\', '/').split('/'):
+        if part == '..':
+            return "path traversal (..)"
+    if '\0' in rel or '\n' in rel:
+        return "null or newline in path"
+    return True
+def _validate_tar_member(member, dst_root):
+    """Validate a tar member for safety. Returns True or error string."""
+    # Reject absolute paths
+    if member.name.startswith('/') or os.path.isabs(member.name):
+        return "blocked: absolute path"
+    # Check every component for '..'
+    for part in member.name.replace('\\', '/').split('/'):
+        if part == '..':
+            return "blocked: path traversal (..)"
+    # Explicitly reject dangerous member types (symlinks, hard links, devices, FIFOs)
+    if member.issym():
+        return "blocked: symlink"
+    if member.islnk():
+        return "blocked: tar hard link"
+    if member.isdev() or member.isfifo() or member.ischr() or member.isblk():
+        return "blocked: device/fifo"
+    # Only allow regular files and directories
+    if not (member.isfile() or member.isdir()):
+        return "blocked: unsupported member type"
+    # Reject null bytes in name
+    if '\0' in member.name:
+        return "blocked: null byte in name"
+    # Resolve final path and verify it stays within dst_root
+    resolved = os.path.realpath(os.path.join(dst_root, member.name))
+    real_dst = os.path.realpath(dst_root)
+    if not resolved.startswith(real_dst + os.sep) and resolved != real_dst:
+        return "blocked: resolves outside destination"
+    return True
+
+
+def _safe_tar_extract(tar, member, dst_root):
+    """Extract a single tar member safely. Returns True on success, error string on failure."""
+    check = _validate_tar_member(member, dst_root)
+    if check is not True:
+        return check
+    # Safe to extract — sanitize member metadata
+    member.uid = member.gid = 0
+    member.uname = member.gname = ""
+    extract_path = _long_path(dst_root) if _system == "Windows" else dst_root
+    try:
+        tar.extract(member, path=extract_path, filter='data')
+    except TypeError:
+        # Python <3.12: filter not supported, but member is already sanitized
+        tar.extract(member, path=extract_path)
+    return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -178,25 +268,30 @@ class DedupDB:
     def __init__(self, dst_root):
         self.dst_root = os.path.realpath(dst_root)
         self.mount = _find_mount_point(dst_root)
-        db_path = os.path.join(self.mount, DEDUP_DB_NAME)
+        # Avoid writing DB to filesystem root — fall back to destination dir
+        if self.mount == "/" or not os.access(self.mount, os.W_OK):
+            db_path = os.path.join(self.dst_root, DEDUP_DB_NAME)
+        else:
+            db_path = os.path.join(self.mount, DEDUP_DB_NAME)
         self.db_path = db_path
         # Prefix to convert dest-relative → mount-relative
         self._prefix = os.path.relpath(self.dst_root, self.mount)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        # Restrict DB file permissions to owner-only (contains file paths/hashes)
+        # Create DB with restrictive permissions (owner-only) to avoid race
+        old_umask = os.umask(0o077)
         try:
-            os.chmod(db_path, 0o600)
-        except OSError:
-            pass
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        finally:
+            os.umask(old_umask)
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=OFF")  # cache is rebuildable
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # WAL default, crash-safe
         self.conn.execute("PRAGMA user_version=4718")  # schema v2
         self.lock = threading.Lock()
         self._init_schema()
 
     def _mount_rel(self, rel_path):
-        """Convert destination-relative path to mount-relative path."""
-        return os.path.join(self._prefix, rel_path)
+        """Convert destination-relative path to mount-relative path.
+        Normalizes to forward slashes for cross-platform DB portability."""
+        return os.path.join(self._prefix, rel_path).replace(os.sep, '/')
 
     def _init_schema(self):
         c = self.conn.cursor()
@@ -286,6 +381,560 @@ class DedupDB:
     def close(self):
         self.conn.commit()
         self.conn.close()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SSH REMOTE — connection, parsing, remote operations
+# ════════════════════════════════════════════════════════════════════════════
+try:
+    import paramiko
+    _has_paramiko = True
+except ImportError:
+    _has_paramiko = False
+
+RemoteSpec = namedtuple("RemoteSpec", ["user", "host", "port", "path"])
+REMOTE_MANIFEST_NAME = ".fast_copy_manifest.json"
+
+
+def parse_remote_path(path_str):
+    """Parse user@host:/path or host:/path. Returns RemoteSpec or None."""
+    m = re.match(r'^(?:([^@]+)@)?([^:]+):(.+)$', path_str)
+    if not m:
+        return None
+    user = m.group(1) or getpass.getuser()
+    host = m.group(2)
+    path = m.group(3)
+    return RemoteSpec(user=user, host=host, port=22, path=path)
+
+
+_ParamikoHostKeyBase = paramiko.MissingHostKeyPolicy if _has_paramiko else object
+
+
+class _InteractiveHostKeyPolicy(_ParamikoHostKeyBase):
+    """Prompts the user to accept unknown host keys, like OpenSSH does."""
+
+    def missing_host_key(self, client, hostname, key):
+        key_type = key.get_name()
+        fingerprint_md5 = ":".join(f"{b:02x}" for b in key.get_fingerprint())
+        import base64
+        fingerprint_sha256 = base64.b64encode(
+            hashlib.sha256(key.asbytes()).digest()
+        ).decode().rstrip("=")
+        print(f"\n  {C.RED}WARNING: Unknown host key for {hostname}.{C.RESET}")
+        print(f"  {C.YELLOW}Verify this fingerprint with the server administrator{C.RESET}")
+        print(f"  {C.YELLOW}before accepting to prevent man-in-the-middle attacks.{C.RESET}")
+        print(f"  Type:        {key_type}")
+        print(f"  MD5:         {fingerprint_md5}")
+        print(f"  SHA256:      {fingerprint_sha256}")
+        try:
+            answer = input(f"  Accept and save to known_hosts? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in ("y", "yes"):
+            raise paramiko.SSHException(
+                f"Host key for {hostname} rejected by user"
+            )
+        # Save to ~/.ssh/known_hosts
+        known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+        os.makedirs(os.path.dirname(known_hosts), exist_ok=True)
+        try:
+            host_keys = paramiko.HostKeys(known_hosts)
+        except (IOError, OSError):
+            host_keys = paramiko.HostKeys()
+        host_keys.add(hostname, key_type, key)
+        try:
+            host_keys.save(known_hosts)
+            print(f"  {C.GREEN}Host key saved to {known_hosts}{C.RESET}")
+        except (IOError, OSError) as e:
+            print(f"  {C.YELLOW}Could not save host key: {e}{C.RESET}")
+
+
+class SSHConnection:
+    """Paramiko SSH wrapper with exec, SFTP, and capability detection."""
+
+    def __init__(self, spec, port=22, key_path=None, password=None, compress=False):
+        self.spec = spec._replace(port=port)
+        self.key_path = key_path
+        self.password = password
+        self.compress = compress
+        self.client = None
+        self.sftp = None
+        self.caps = {}
+
+    def connect(self):
+        if not _has_paramiko:
+            print(f"{C.RED}Error: paramiko not installed. Run: pip install paramiko{C.RESET}")
+            sys.exit(1)
+
+        self.client = paramiko.SSHClient()
+        # Load system known_hosts for host key verification
+        try:
+            self.client.load_system_host_keys()
+        except IOError:
+            pass
+        known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+        if os.path.isfile(known_hosts):
+            try:
+                self.client.load_host_keys(known_hosts)
+            except IOError:
+                pass
+        self.client.set_missing_host_key_policy(_InteractiveHostKeyPolicy())
+
+        connect_kwargs = {
+            "hostname": self.spec.host,
+            "port": self.spec.port,
+            "username": self.spec.user,
+            "compress": self.compress,
+        }
+
+        # Auth: try key file → agent/default keys → password
+        if self.key_path:
+            connect_kwargs["key_filename"] = self.key_path
+        if self.password:
+            connect_kwargs["password"] = self.password
+
+        max_attempts = 3
+        try:
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self.client.connect(**connect_kwargs)
+                    break  # success
+                except (paramiko.AuthenticationException, paramiko.SSHException) as e:
+                    # Only retry on auth-related errors, not connection errors
+                    if "auth" not in str(e).lower() and "No authentication" not in str(e):
+                        raise
+                    if attempt == max_attempts:
+                        print(f"\n  {C.RED}Authentication failed after {max_attempts} attempts.{C.RESET}")
+                        self.client.close()
+                        sys.exit(1)
+                    print(f"  {C.YELLOW}Authentication failed. Attempt {attempt}/{max_attempts}.{C.RESET}")
+                    pw = getpass.getpass(f"  Password for {self.spec.user}@{self.spec.host}: ")
+                    connect_kwargs["password"] = pw
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n  {C.YELLOW}Authentication cancelled.{C.RESET}")
+            self.client.close()
+            sys.exit(0)
+
+        transport = self.client.get_transport()
+        transport.set_keepalive(30)
+        # Increase default window/packet size for much faster SFTP throughput
+        transport.default_window_size = 16 * 1024 * 1024      # 16 MB
+        transport.default_max_packet_size = 512 * 1024         # 512 KB
+
+        self._detect_capabilities()
+        return self
+
+    MAX_CMD_OUTPUT = 100 * 1024 * 1024  # 100 MB cap on command output
+
+    def exec_cmd(self, cmd, input_data=None, timeout=300):
+        """Execute remote command. Returns (stdout_str, stderr_str, exit_code)."""
+        import threading
+        stdin, stdout, stderr = self.client.exec_command(cmd, timeout=timeout)
+        if input_data:
+            # Write stdin in a background thread to avoid deadlock: the remote
+            # command may produce stdout while we're still writing stdin, and if
+            # either buffer fills both sides stall.
+            data = input_data.encode("utf-8") if isinstance(input_data, str) else input_data
+            def _write_stdin():
+                try:
+                    chunk_size = 65536
+                    for i in range(0, len(data), chunk_size):
+                        stdin.write(data[i:i + chunk_size])
+                finally:
+                    stdin.channel.shutdown_write()
+            writer = threading.Thread(target=_write_stdin, daemon=True)
+            writer.start()
+        out = stdout.read(self.MAX_CMD_OUTPUT).decode("utf-8", errors="replace")
+        err = stderr.read(self.MAX_CMD_OUTPUT).decode("utf-8", errors="replace")
+        rc = stdout.channel.recv_exit_status()
+        if input_data:
+            writer.join(timeout=30)
+        return out, err, rc
+
+    def open_sftp(self):
+        if self.sftp is None:
+            transport = self.client.get_transport()
+            try:
+                self.sftp = paramiko.SFTPClient.from_transport(
+                    transport,
+                    window_size=16 * 1024 * 1024,     # 16 MB (default ~2 MB)
+                    max_packet_size=512 * 1024,         # 512 KB (default 32 KB)
+                )
+            except Exception:
+                # Some SSH servers reject large window/packet sizes — fall back
+                self.sftp = paramiko.SFTPClient.from_transport(transport)
+        return self.sftp
+
+    def open_channel(self):
+        """Open a raw exec channel for streaming."""
+        return self.client.get_transport().open_session()
+
+    def _detect_capabilities(self):
+        """Check what tools are available on remote."""
+        for tool, cmd in [
+            ("gnu_find", "find --version 2>/dev/null"),
+            ("tar", "tar --version 2>/dev/null"),
+            ("python3", "python3 --version 2>/dev/null"),
+            ("sha256sum", "sha256sum --version 2>/dev/null"),
+        ]:
+            _, _, rc = self.exec_cmd(cmd, timeout=10)
+            self.caps[tool] = (rc == 0)
+
+    def close(self):
+        if self.sftp:
+            self.sftp.close()
+        if self.client:
+            self.client.close()
+
+
+def check_remote_space(ssh, remote_path, required_bytes, force=False):
+    """Check free space on remote via df. Walks up to parent if path doesn't exist."""
+    # Try the path itself, then walk up to find an existing parent
+    check_path = remote_path
+    for _ in range(10):
+        out, _, rc = ssh.exec_cmd(f"df -B1 {shlex.quote(check_path)} 2>/dev/null")
+        if rc == 0:
+            break
+        parent = posixpath.dirname(check_path.rstrip("/"))
+        if parent == check_path or not parent:
+            break
+        check_path = parent
+    if rc != 0:
+        print(f"  {C.YELLOW}Could not check remote space — continuing anyway{C.RESET}")
+        return True  # don't block copy just because df failed
+
+    lines = out.strip().split("\n")
+    if len(lines) < 2:
+        if force:
+            return True
+        print(f"  {C.RED}Could not parse remote df output{C.RESET}")
+        return False
+
+    parts = lines[1].split()
+    try:
+        total = int(parts[1])
+        free = int(parts[3])
+    except (IndexError, ValueError):
+        if force:
+            return True
+        return False
+
+    pct_free = free / total * 100 if total else 0
+    print(f"  Destination disk (remote):")
+    print(f"    Total:     {C.BOLD}{fmt_size(total)}{C.RESET}")
+    print(f"    Free:      {C.BOLD}{fmt_size(free)}{C.RESET} ({pct_free:.1f}% free)")
+    print(f"    Required:  {C.BOLD}{fmt_size(required_bytes)}{C.RESET}")
+
+    if required_bytes > free:
+        shortfall = required_bytes - free
+        print(f"\n  {C.RED}✗ NOT ENOUGH SPACE — need {fmt_size(shortfall)} more{C.RESET}")
+        if force:
+            print(f"  {C.YELLOW}Proceeding anyway (--force){C.RESET}")
+            return True
+        return False
+
+    print(f"    Headroom:  {fmt_size(free - required_bytes)}")
+    print(f"\n  {C.GREEN}✓ Enough space{C.RESET}")
+    return True
+
+
+def ensure_remote_dirs(ssh, remote_root, entries):
+    """Create all needed directories on remote in one SSH call."""
+    dirs = sorted(set(
+        posixpath.join(remote_root, posixpath.dirname(e.rel))
+        for e in entries if posixpath.dirname(e.rel)
+    ))
+    if not dirs:
+        return
+    # Batch mkdir -p
+    dir_args = " ".join(shlex.quote(d) for d in dirs)
+    ssh.exec_cmd(f"mkdir -p {dir_args}")
+
+
+import hmac as _hmac_mod
+
+# Key derived from username + hostname — ties manifest to this machine pair.
+# NOTE: This is an integrity check (detects corruption/accidental edits),
+# not cryptographic authentication (a local attacker could recompute the HMAC).
+def _manifest_key():
+    return hashlib.sha256(
+        f"fast_copy:{getpass.getuser()}:{platform.node()}".encode()
+    ).digest()
+
+
+def _read_remote_file(ssh, path):
+    """Read a file from remote, trying SFTP first then exec."""
+    try:
+        sftp = ssh.open_sftp()
+        with sftp.open(path, "r") as f:
+            return f.read().decode("utf-8")
+    except Exception:
+        pass
+    # Fallback: exec
+    try:
+        out, _, rc = ssh.exec_cmd(f"cat {shlex.quote(path)}", timeout=30)
+        if rc == 0 and out.strip():
+            return out
+    except Exception:
+        pass
+    return None
+
+
+def _write_remote_file(ssh, path, content):
+    """Write a file to remote, trying SFTP first then exec."""
+    try:
+        sftp = ssh.open_sftp()
+        with sftp.open(path, "w") as f:
+            f.write(content.encode("utf-8") if isinstance(content, str) else content)
+        return
+    except Exception:
+        pass
+    # Fallback: exec
+    try:
+        ssh.exec_cmd(
+            f"cat > {shlex.quote(path)}", input_data=content, timeout=30
+        )
+    except Exception:
+        pass
+
+
+def load_remote_manifest(ssh, remote_root):
+    """Load previous-run manifest from remote. Verifies HMAC. Returns dict or empty."""
+    manifest_path = posixpath.join(remote_root, REMOTE_MANIFEST_NAME)
+    try:
+        raw = _read_remote_file(ssh, manifest_path)
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        stored_mac = data.pop("__hmac__", None)
+        if stored_mac is None:
+            return {}  # unsigned manifest — treat as absent
+        payload = json.dumps(data, sort_keys=True).encode()
+        expected = _hmac_mod.new(_manifest_key(), payload, hashlib.sha256).hexdigest()
+        if not _hmac_mod.compare_digest(stored_mac, expected):
+            return {}  # tampered — ignore
+        return data
+    except (IOError, OSError, json.JSONDecodeError, KeyError):
+        return {}
+
+
+def save_remote_manifest(ssh, remote_root, entries, link_map):
+    """Save HMAC-signed manifest after successful copy."""
+    manifest = {}
+    for e in entries:
+        if e.content_hash:
+            manifest[e.rel] = {"size": e.size, "hash": e.content_hash}
+    for dup_rel, target in link_map.items():
+        if isinstance(target, tuple):
+            continue
+        for e in entries:
+            if e.rel == target and e.content_hash:
+                manifest[dup_rel] = {"size": e.size, "hash": e.content_hash}
+                break
+
+    # Sign with HMAC
+    payload = json.dumps(manifest, sort_keys=True).encode()
+    mac = _hmac_mod.new(_manifest_key(), payload, hashlib.sha256).hexdigest()
+    manifest["__hmac__"] = mac
+
+    manifest_path = posixpath.join(remote_root, REMOTE_MANIFEST_NAME)
+    _write_remote_file(ssh, manifest_path, json.dumps(manifest))
+
+
+def scan_remote_destination(ssh, remote_root):
+    """Get file listing from remote in one SSH call. Returns {rel_path: size}."""
+    # Check if remote directory exists first
+    _, _, rc = ssh.exec_cmd(f'test -d {shlex.quote(remote_root)}', timeout=10)
+    if rc != 0:
+        return {}  # directory doesn't exist yet — nothing to compare
+
+    if ssh.caps.get("gnu_find"):
+        cmd = f'find {shlex.quote(remote_root)} -type f -printf "%s\\t%p\\n" 2>/dev/null'
+        out, _, rc = ssh.exec_cmd(cmd)
+        result = {}
+        for line in out.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                try:
+                    size = int(parts[0])
+                    path = parts[1]
+                    rel = posixpath.relpath(path, remote_root)
+                    result[rel] = size
+                except (ValueError, TypeError):
+                    continue
+        return result
+    else:
+        # Portable fallback: find + stat (Linux stat -c, not BSD stat -f)
+        cmd = (f'find {shlex.quote(remote_root)} -type f '
+               f'-exec stat -c "%s %n" {{}} + 2>/dev/null || '
+               f'find {shlex.quote(remote_root)} -type f '
+               f'-exec stat -f "%z %N" {{}} + 2>/dev/null')
+        out, _, rc = ssh.exec_cmd(cmd)
+        result = {}
+        for line in out.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                try:
+                    size = int(parts[0])
+                    path = parts[1]
+                    rel = posixpath.relpath(path, remote_root)
+                    result[rel] = size
+                except (ValueError, TypeError):
+                    continue
+        return result
+
+
+def remote_hash_files(ssh, remote_root, rel_paths):
+    """Hash files on remote in batches. Returns {rel_path: hash_hex}."""
+    if not rel_paths:
+        return {}
+
+    BATCH_SIZE = 5000  # files per SSH command to avoid channel timeouts
+    result = {}
+
+    for batch_start in range(0, len(rel_paths), BATCH_SIZE):
+        batch = rel_paths[batch_start:batch_start + BATCH_SIZE]
+        full_paths = [posixpath.join(remote_root, rp) for rp in batch]
+        path_input = "\n".join(full_paths) + "\n"
+
+        if ssh.caps.get("python3"):
+            script = (
+                'import sys,hashlib\n'
+                'for line in sys.stdin:\n'
+                '  p=line.strip()\n'
+                '  h=hashlib.sha256()\n'
+                '  try:\n'
+                '    with open(p,"rb") as f:\n'
+                '      while True:\n'
+                '        c=f.read(1048576)\n'
+                '        if not c:break\n'
+                '        h.update(c)\n'
+                '    print(h.hexdigest(),p)\n'
+                '  except Exception:print("ERROR",p)\n'
+            )
+            out, _, _ = ssh.exec_cmd(
+                f"python3 -c {shlex.quote(script)}", input_data=path_input,
+                timeout=600
+            )
+        elif ssh.caps.get("sha256sum"):
+            out, _, _ = ssh.exec_cmd(
+                "xargs -d '\\n' sha256sum",
+                input_data=path_input, timeout=600
+            )
+        else:
+            return {}  # can't hash remotely
+
+        for line in out.strip().split("\n"):
+            if not line or line.startswith("ERROR"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                h, path = parts
+                rel = posixpath.relpath(path.strip(), remote_root)
+                result[rel] = h
+
+        if len(rel_paths) > BATCH_SIZE:
+            done = min(batch_start + BATCH_SIZE, len(rel_paths))
+            print(f"\r  {C.DIM}Hashed {done}/{len(rel_paths)} files on remote...{C.RESET}", end="", flush=True)
+
+    if len(rel_paths) > BATCH_SIZE:
+        print()  # newline after progress
+    return result
+
+
+def filter_unchanged_remote(entries, link_map, ssh, remote_root):
+    """Incremental check against remote. Uses manifest or find+hash."""
+    print(f"  {C.DIM}Checking remote for existing files...{C.RESET}", end="", flush=True)
+
+    # Try manifest first (instant), fall back to find
+    manifest = load_remote_manifest(ssh, remote_root)
+    if manifest:
+        print(f"\r  {C.DIM}Loaded manifest ({len(manifest)} entries){C.RESET}          ")
+        remote_files = {k: v["size"] for k, v in manifest.items()}
+        remote_hashes = {k: v.get("hash") for k, v in manifest.items()}
+    else:
+        print(f"\r  {C.DIM}No manifest, scanning remote...{C.RESET}          ")
+        remote_files = scan_remote_destination(ssh, remote_root)
+        remote_hashes = {}
+
+    need_copy = []
+    need_hash = []
+    skipped = []
+    skipped_bytes = 0
+
+    # Quick pass: size check
+    for entry in entries:
+        if entry.rel not in remote_files:
+            need_copy.append(entry)
+        elif remote_files[entry.rel] != entry.size:
+            need_copy.append(entry)
+        else:
+            # Same size — check hash if available in manifest
+            if entry.rel in remote_hashes and remote_hashes[entry.rel]:
+                if entry.content_hash and entry.content_hash == remote_hashes[entry.rel]:
+                    skipped.append(entry)
+                    skipped_bytes += entry.size
+                else:
+                    need_hash.append(entry)
+            else:
+                need_hash.append(entry)
+
+    # Hash pass for same-size files without manifest match
+    if need_hash:
+        print(f"  {C.DIM}Hashing {len(need_hash)} files on remote...{C.RESET}", end="", flush=True)
+        remote_h = remote_hash_files(ssh, remote_root, [e.rel for e in need_hash])
+        for entry in need_hash:
+            rh = remote_h.get(entry.rel)
+            # Remote used sha256, local may have xxh128 — compare if same algo
+            # For cross-algo: re-hash locally with sha256 for comparison
+            if rh and entry.content_hash:
+                # If hashes match (same algo) skip; otherwise must copy
+                # Since remote always uses sha256, re-hash source with sha256
+                local_sha = hash_file_sha256(entry.src)
+                if local_sha == rh:
+                    skipped.append(entry)
+                    skipped_bytes += entry.size
+                    continue
+            need_copy.append(entry)
+
+    # Filter link_map
+    new_link_map = {}
+    skipped_links = 0
+    for dup_rel, canonical_rel in link_map.items():
+        if dup_rel in remote_files:
+            skipped_links += 1
+        else:
+            new_link_map[dup_rel] = canonical_rel
+
+    print(f"\r  {C.GREEN}Remote incremental check complete:{C.RESET}                              ")
+    print(f"    To copy:   {C.BOLD}{len(need_copy)}{C.RESET} files "
+          f"({fmt_size(sum(e.size for e in need_copy))})")
+    print(f"    Skipped:   {C.BOLD}{len(skipped)}{C.RESET} files unchanged "
+          f"({C.GREEN}{fmt_size(skipped_bytes)}{C.RESET})")
+    if skipped_links:
+        print(f"    Links:     {C.BOLD}{skipped_links}{C.RESET} already exist, "
+              f"{C.BOLD}{len(new_link_map)}{C.RESET} to create")
+
+    return need_copy, new_link_map, len(skipped) + skipped_links, skipped_bytes
+
+
+def hash_file_sha256(filepath):
+    """Hash file with SHA-256 (for comparing with remote sha256sum)."""
+    h = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(HASH_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -391,7 +1040,7 @@ def get_physical_offset_windows(filepath):
             return first_lcn if first_lcn >= 0 else 0
         finally:
             CloseHandle(handle)
-    except Exception:
+    except (OSError, ValueError, struct.error):
         return 0
 
 
@@ -426,7 +1075,7 @@ def get_physical_offset_linux(filepath):
             return physical
         finally:
             os.close(fd)
-    except Exception:
+    except (OSError, ValueError, struct.error):
         try:
             import fcntl
             FIBMAP = 1
@@ -437,7 +1086,7 @@ def get_physical_offset_linux(filepath):
                 return struct.unpack("<I", result)[0]
             finally:
                 os.close(fd)
-        except Exception:
+        except (OSError, ValueError, struct.error):
             return 0
 
 
@@ -448,7 +1097,7 @@ def get_physical_offset_macos(filepath):
     """inode number as proxy for physical position."""
     try:
         return os.stat(filepath).st_ino
-    except Exception:
+    except OSError:
         return 0
 
 
@@ -456,6 +1105,22 @@ def get_physical_offset_macos(filepath):
 # UNIFIED OFFSET GETTER
 # ════════════════════════════════════════════════════════════════════════════
 _system = platform.system()
+
+
+def _long_path(p):
+    """On Windows, prefix paths with \\\\?\\ to bypass the 260-char MAX_PATH limit.
+    Use ONLY for actual file I/O (open, makedirs, walk), NOT for path comparison."""
+    if _system == "Windows" and not p.startswith("\\\\?\\"):
+        return "\\\\?\\" + os.path.abspath(p)
+    return p
+
+
+def _strip_long_path(p):
+    """Strip the \\\\?\\ prefix if present (for path comparison/relpath)."""
+    if p.startswith("\\\\?\\"):
+        return p[4:]
+    return p
+
 
 def get_physical_offset(filepath):
     if _system == "Linux":
@@ -493,7 +1158,7 @@ def scan_source(src_root, dst_root=None, excludes=None):
         print(f"\n  {C.YELLOW}Warning: Destination is inside source — it will be excluded{C.RESET}")
 
     # Compile exclude patterns
-    exclude_names = {TAR_BUNDLE_NAME, DEDUP_DB_NAME}  # skip our own files
+    exclude_names = {TAR_BUNDLE_NAME, DEDUP_DB_NAME, REMOTE_MANIFEST_NAME}  # skip our own files
     if excludes:
         for ex in excludes:
             exclude_names.add(ex)
@@ -503,23 +1168,25 @@ def scan_source(src_root, dst_root=None, excludes=None):
         dir_errors.append((err.filename, str(err)))
 
     # followlinks=True so we traverse Windows junctions & symlinks
-    for root, dirs, files in os.walk(src_root, followlinks=True, onerror=on_walk_error):
+    # Use _long_path on Windows to see files beyond 260-char MAX_PATH
+    walk_src = _long_path(src_root)
+    for root, dirs, files in os.walk(walk_src, followlinks=True, onerror=on_walk_error):
         # Circular symlink protection
         try:
-            real = os.path.realpath(root)
+            real = os.path.realpath(_strip_long_path(root))
             if real in visited_real:
                 dirs.clear()  # don't descend further
                 continue
             visited_real.add(real)
         except OSError:
-            pass
+            dirs.clear()  # can't resolve — skip to avoid infinite loop
+            continue
 
         # Skip destination directory if inside source
         if dst_real:
-            real_root = os.path.realpath(root)
             dirs_to_remove = []
             for d in dirs:
-                dir_real = os.path.realpath(os.path.join(root, d))
+                dir_real = os.path.realpath(_strip_long_path(os.path.join(root, d)))
                 if dir_real == dst_real or dst_real.startswith(dir_real + os.sep):
                     dirs_to_remove.append(d)
                     skipped_dst = True
@@ -532,7 +1199,7 @@ def scan_source(src_root, dst_root=None, excludes=None):
                 continue
 
             src_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(src_path, src_root)
+            rel_path = os.path.relpath(_strip_long_path(src_path), src_root).replace(os.sep, "/")
             try:
                 sz = os.path.getsize(src_path)
                 entries.append(FileEntry(
@@ -543,7 +1210,7 @@ def scan_source(src_root, dst_root=None, excludes=None):
                 if scan_count % 1000 == 0:
                     print(f"\r  {C.DIM}Scanning... {scan_count} files{C.RESET}", end="", flush=True)
             except OSError as e:
-                errors.append((src_path, str(e)))
+                errors.append((_strip_long_path(src_path), str(e)))
 
     print(f"\r  {C.GREEN}Found {len(entries)} files{C.RESET}                    ")
 
@@ -644,16 +1311,16 @@ def deduplicate(entries, threads=DEFAULT_THREADS, dedup_db=None):
 
     def do_hash(idx):
         entry = entries[idx]
-        # Use full source path as cache key to avoid collisions when
-        # different files share the same basename (e.g. single-file mode)
         cache_key = entry.src
+        # Stat before hash to get mtime for cache lookup/store
+        try:
+            pre_stat = os.stat(entry.src)
+            mtime_ns_before = pre_stat.st_mtime_ns
+        except OSError:
+            mtime_ns_before = 0
         # Try cache first
-        if dedup_db:
-            try:
-                mtime_ns = os.stat(entry.src).st_mtime_ns
-            except OSError:
-                mtime_ns = 0
-            cached = dedup_db.lookup(cache_key, entry.size, mtime_ns)
+        if dedup_db and mtime_ns_before:
+            cached = dedup_db.lookup(cache_key, entry.size, mtime_ns_before)
             if cached:
                 hashes[idx] = cached
                 with lock:
@@ -663,12 +1330,14 @@ def deduplicate(entries, threads=DEFAULT_THREADS, dedup_db=None):
         h = hash_file(entry.src)
         hashes[idx] = h
         if dedup_db and h is not None:
+            # Stat after hash — only cache if mtime unchanged (no TOCTOU)
             try:
-                mtime_ns = os.stat(entry.src).st_mtime_ns
+                mtime_ns_after = os.stat(entry.src).st_mtime_ns
             except OSError:
-                mtime_ns = 0
-            with lock:
-                new_hashes.append((cache_key, entry.size, mtime_ns, h))
+                mtime_ns_after = -1
+            if mtime_ns_before == mtime_ns_after and mtime_ns_before != 0:
+                with lock:
+                    new_hashes.append((cache_key, entry.size, mtime_ns_before, h))
 
     with ThreadPoolExecutor(max_workers=threads) as pool:
         futures = [pool.submit(do_hash, i) for i in range(total)]
@@ -781,12 +1450,12 @@ def create_links(link_map, dst_root):
     errors = 0
 
     for dup_rel, target in link_map.items():
-        dst_dup = os.path.join(dst_root, dup_rel)
+        dst_dup = _long_path(os.path.join(dst_root, dup_rel))
         # Target is either a rel path or ("__abs__", full_path) for cross-run dedup
         if isinstance(target, tuple) and target[0] == "__abs__":
-            dst_canonical = target[1]
+            dst_canonical = _long_path(target[1])
         else:
-            dst_canonical = os.path.join(dst_root, target)
+            dst_canonical = _long_path(os.path.join(dst_root, target))
 
         os.makedirs(os.path.dirname(dst_dup), exist_ok=True)
 
@@ -800,8 +1469,10 @@ def create_links(link_map, dst_root):
 
         # Try symlink (works on most filesystems)
         try:
-            # Compute relative path from dup to canonical
-            rel_target = os.path.relpath(dst_canonical, os.path.dirname(dst_dup))
+            # Compute relative path from dup to canonical (strip \\?\ for relpath)
+            rel_target = os.path.relpath(
+                _strip_long_path(dst_canonical),
+                os.path.dirname(_strip_long_path(dst_dup)))
             os.symlink(rel_target, dst_dup)
             # Verify the symlink actually resolves (NTFS via Linux creates
             # symlinks that don't work)
@@ -831,7 +1502,7 @@ def create_links(link_map, dst_root):
     if errors:
         results.append(f"{C.RED}{errors} errors{C.RESET}")
 
-    print(f"\r  {C.GREEN}Links created: {', '.join(results)}{C.RESET}                    ")
+    print(f"\n  {C.GREEN}Links created: {', '.join(results)}{C.RESET}                    ")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -931,13 +1602,14 @@ def copy_block_stream(small_entries, dst_root, progress, cancel_check=None):
         return
 
     small_size = sum(e.size for e in small_entries)
-    tar_path = os.path.join(dst_root, TAR_BUNDLE_NAME)
 
     print(f"  {C.CYAN}Bundling {len(small_entries)} small files ({fmt_size(small_size)}) "
           f"into single block stream...{C.RESET}")
 
     # ── Step 1: Write tar archive to USB (one big sequential write) ───
     os.makedirs(dst_root, exist_ok=True)
+    fd, tar_path = tempfile.mkstemp(suffix='.tar', dir=dst_root)
+    os.close(fd)
 
     try:
         with tarfile.open(tar_path, "w") as tar:
@@ -945,9 +1617,12 @@ def copy_block_stream(small_entries, dst_root, progress, cancel_check=None):
                 if cancel_check and cancel_check():
                     break
                 try:
-                    # Read file into memory (it's small, fits easily)
+                    # Read file into memory (capped at threshold)
                     with open(entry.src, "rb") as f:
-                        data = f.read()
+                        data = f.read(SMALL_FILE_THRESHOLD + 1)
+                    if len(data) != entry.size:
+                        print(f"\n  {C.YELLOW}Warning: {entry.rel} changed size "
+                              f"({entry.size} → {len(data)}){C.RESET}")
 
                     # Create tar entry with metadata
                     info = tarfile.TarInfo(name=entry.rel)
@@ -990,28 +1665,11 @@ def copy_block_stream(small_entries, dst_root, progress, cancel_check=None):
         with tarfile.open(tar_path, "r") as tar:
             for member in tar.getmembers():
                 try:
-                    # Validate member name to prevent path traversal
-                    if member.name.startswith('/') or '..' in member.name.split('/'):
-                        extract_errors.append((member.name, "blocked: unsafe path"))
-                        continue
-
-                    dst_member = os.path.join(dst_root, member.name)
-
-                    # If file exists with read-only perms (e.g. .git/objects),
-                    # make it writable so we can overwrite
-                    if os.path.exists(dst_member) and not os.access(dst_member, os.W_OK):
-                        try:
-                            os.chmod(dst_member, 0o644)
-                        except OSError:
-                            pass
-
-                    try:
-                        tar.extract(member, path=dst_root, filter='data')
-                    except TypeError:
-                        # Python <3.12 doesn't support filter argument
-                        tar.extract(member, path=dst_root)
-                    extracted += 1
-
+                    result = _safe_tar_extract(tar, member, dst_root)
+                    if result is True:
+                        extracted += 1
+                    else:
+                        extract_errors.append((member.name, result))
                 except (OSError, tarfile.TarError) as e:
                     extract_errors.append((member.name, str(e)))
 
@@ -1051,7 +1709,8 @@ def copy_individual(entries, dst_root, progress, buf, cancel_check=None):
             os.makedirs(dst_dir, exist_ok=True)
 
             if entry.size == 0:
-                open(dst_path, "wb").close()
+                with open(dst_path, "wb"):
+                    pass
                 progress.update(0, 1)
                 progress.display()
                 continue
@@ -1115,6 +1774,289 @@ def copy_hybrid(entries, dst_root, progress, buf_size, cancel_check=None):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# SSH REMOTE COPY — large files (SFTP) + small files (tar stream)
+# ════════════════════════════════════════════════════════════════════════════
+def copy_individual_remote(entries, ssh, remote_root, progress, buf_size):
+    """Copy large files to remote via SFTP with pipelined writes."""
+    sftp = ssh.open_sftp()
+    buf = bytearray(buf_size)
+    mv = memoryview(buf)
+
+    for entry in entries:
+        remote_path = posixpath.join(remote_root, entry.rel)
+
+        try:
+            if entry.size == 0:
+                with sftp.open(remote_path, "w"):
+                    pass
+                progress.update(0, 1)
+                progress.display()
+                continue
+
+            with open(entry.src, "rb") as fin:
+                with sftp.open(remote_path, "wb") as fout:
+                    fout.set_pipelined(True)
+                    while True:
+                        n = fin.readinto(buf)
+                        if not n:
+                            break
+                        fout.write(mv[:n])
+                        progress.update(n)
+                        progress.display()
+
+            # Preserve timestamps
+            try:
+                st = os.stat(entry.src)
+                sftp.utime(remote_path, (st.st_atime, st.st_mtime))
+            except OSError:
+                pass
+
+            progress.update(0, 1)
+
+        except (OSError, IOError) as e:
+            print(f"\n  {C.RED}Error: {entry.rel}: {e}{C.RESET}")
+            progress.update(entry.size, 1)
+
+
+TAR_CHUNK_SIZE = 100 * 1024 * 1024  # 100 MB per tar batch
+
+
+def _batch_by_size(entries, max_bytes=TAR_CHUNK_SIZE, max_files=10000):
+    """Split entries into batches of approximately max_bytes or max_files each."""
+    batches = []
+    current = []
+    current_size = 0
+    for e in entries:
+        current.append(e)
+        current_size += e.size
+        if current_size >= max_bytes or len(current) >= max_files:
+            batches.append(current)
+            current = []
+            current_size = 0
+    if current:
+        batches.append(current)
+    return batches
+
+
+class _ChannelWriter:
+    """File-like wrapper for paramiko channel — used by tarfile streaming."""
+    def __init__(self, channel):
+        self.channel = channel
+        self.written = 0
+    def write(self, data):
+        self.channel.sendall(data)
+        self.written += len(data)
+        return len(data)
+    def close(self):
+        pass
+    def tell(self):
+        return self.written
+
+
+def _stream_tar_batch_to_remote(batch, ssh, remote_root, progress):
+    """Upload one batch of files via tar stream to remote."""
+    channel = ssh.open_channel()
+    channel.exec_command(
+        f"tar xf - --no-same-owner --no-same-permissions -C {shlex.quote(remote_root)}"
+    )
+
+    writer = _ChannelWriter(channel)
+    errors = 0
+
+    try:
+        with tarfile.open(fileobj=writer, mode="w|") as tar:
+            for entry in batch:
+                try:
+                    check = _validate_rel_path(entry.rel)
+                    if check is not True:
+                        errors += 1
+                        continue
+                    info = tarfile.TarInfo(name=entry.rel)
+                    info.size = entry.size
+                    st = os.stat(entry.src)
+                    info.mtime = st.st_mtime
+                    info.mode = st.st_mode & 0o7777
+
+                    with open(entry.src, "rb") as f:
+                        tar.addfile(info, f)
+
+                    progress.update(entry.size, 1)
+                    progress.display()
+                except (OSError, IOError) as e:
+                    errors += 1
+    except Exception as e:
+        print(f"\n  {C.RED}Tar stream error: {e}{C.RESET}")
+
+    channel.shutdown_write()
+    rc = channel.recv_exit_status()
+
+    if rc != 0:
+        stderr = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+        print(f"\n  {C.YELLOW}Remote tar exited {rc}: {stderr[:200]}{C.RESET}")
+
+    if errors:
+        print(f"  {C.YELLOW}{errors} files failed to stream{C.RESET}")
+
+    channel.close()
+    return writer.written
+
+
+def copy_block_stream_remote(entries, ssh, remote_root, progress):
+    """Stream files as chunked tar batches over SSH → remote tar extracts."""
+    if not entries:
+        return
+
+    if not ssh.caps.get("tar"):
+        print(f"  {C.YELLOW}Remote has no tar — falling back to SFTP{C.RESET}")
+        copy_individual_remote(entries, ssh, remote_root, progress, 1 * 1024 * 1024)
+        return
+
+    total_size = sum(e.size for e in entries)
+    batches = _batch_by_size(entries)
+    print(f"  Streaming {len(entries)} files ({fmt_size(total_size)}) in "
+          f"{len(batches)} batch{'es' if len(batches) != 1 else ''} to remote...")
+
+    total_sent = 0
+    for i, batch in enumerate(batches):
+        batch_size = sum(e.size for e in batch)
+        if len(batches) > 1:
+            print(f"\n  {C.DIM}Batch {i+1}/{len(batches)}: {len(batch)} files "
+                  f"({fmt_size(batch_size)}){C.RESET}")
+        total_sent += _stream_tar_batch_to_remote(batch, ssh, remote_root, progress)
+
+    print(f"\n  {C.GREEN}Tar stream: {fmt_size(total_sent)} sent{C.RESET}")
+
+
+def copy_hybrid_remote(entries, ssh, remote_root, progress, buf_size):
+    """Local-to-remote: tar stream for all files (much faster than SFTP)."""
+    total_size = sum(e.size for e in entries)
+
+    # Create all directories first in one shot
+    ensure_remote_dirs(ssh, remote_root, entries)
+
+    if ssh.caps.get("tar"):
+        print(f"  Strategy: tar stream for all {C.BOLD}{len(entries)}{C.RESET} files "
+              f"({C.BOLD}{fmt_size(total_size)}{C.RESET})")
+        print()
+        copy_block_stream_remote(entries, ssh, remote_root, progress)
+    else:
+        # Fallback: SFTP for everything if tar not available
+        print(f"  Strategy (no remote tar — using SFTP):")
+        print(f"    {C.BOLD}{len(entries)}{C.RESET} files, "
+              f"{C.BOLD}{fmt_size(total_size)}{C.RESET}")
+        print()
+        copy_individual_remote(entries, ssh, remote_root, progress, buf_size)
+
+
+def create_links_remote(ssh, link_map, remote_root):
+    """Create hard links on remote via a single Python script over SSH."""
+    if not link_map:
+        return
+
+    print(f"  {C.DIM}Creating {len(link_map)} links on remote...{C.RESET}", end="", flush=True)
+
+    # Build link pairs: source\tdest per line
+    lines = []
+    for dup_rel, target in link_map.items():
+        dst_dup = posixpath.join(remote_root, dup_rel)
+        if isinstance(target, tuple) and target[0] == "__abs__":
+            dst_canonical = target[1]
+            if '\0' in dst_canonical or not posixpath.isabs(dst_canonical):
+                continue
+        else:
+            dst_canonical = posixpath.join(remote_root, target)
+            if '..' in target.split('/') or '\0' in target:
+                continue
+        lines.append(f"{dst_canonical}\t{dst_dup}")
+
+    link_input = "\n".join(lines) + "\n"
+
+    # Remote Python script: reads pairs from stdin, creates links efficiently
+    script = (
+        'import sys,os\n'
+        'ok=fail=0\n'
+        'for line in sys.stdin:\n'
+        '  line=line.strip()\n'
+        '  if not line:continue\n'
+        '  parts=line.split("\\t",1)\n'
+        '  if len(parts)!=2:continue\n'
+        '  src,dst=parts\n'
+        '  try:\n'
+        '    os.makedirs(os.path.dirname(dst),exist_ok=True)\n'
+        '    try:os.link(src,dst);ok+=1\n'
+        '    except OSError:\n'
+        '      try:os.symlink(src,dst);ok+=1\n'
+        '      except OSError:\n'
+        '        import shutil;shutil.copy2(src,dst);ok+=1\n'
+        '  except Exception:fail+=1\n'
+        'print(f"{ok} {fail}")\n'
+    )
+
+    BATCH = 5000
+    total_ok = 0
+    total_failed = 0
+    for i in range(0, len(lines), BATCH):
+        batch_input = "\n".join(lines[i:i + BATCH]) + "\n"
+        out, _, rc = ssh.exec_cmd(
+            f"python3 -c {shlex.quote(script)}", input_data=batch_input, timeout=600
+        )
+        try:
+            parts = out.strip().split()
+            total_ok += int(parts[0])
+            total_failed += int(parts[1])
+        except (ValueError, IndexError):
+            total_failed += min(BATCH, len(lines) - i)
+
+        if len(lines) > BATCH:
+            done = min(i + BATCH, len(lines))
+            sys.stdout.write(f"\r  {C.DIM}Links: {done}/{len(lines)}...{C.RESET}          ")
+            sys.stdout.flush()
+
+    if total_failed:
+        print(f"\r  {C.YELLOW}Links: {total_ok} created, {total_failed} failed on remote{C.RESET}                    ")
+    else:
+        print(f"\r  {C.GREEN}Links created: {total_ok} on remote{C.RESET}                    ")
+
+
+def verify_copy_remote(ssh, entries, link_map, remote_root):
+    """Verify files on remote: check existence + size via find."""
+    total_to_check = len(entries) + len(link_map)
+    print(f"\n  {C.DIM}Verifying {total_to_check} files on remote...{C.RESET}", end="", flush=True)
+
+    remote_files = scan_remote_destination(ssh, remote_root)
+
+    missing = []
+    mismatches = []
+
+    for entry in entries:
+        if entry.rel not in remote_files:
+            missing.append(entry.rel)
+        elif remote_files[entry.rel] != entry.size:
+            mismatches.append((entry.rel, entry.size, remote_files[entry.rel]))
+
+    for dup_rel in link_map:
+        if dup_rel not in remote_files:
+            missing.append(f"{dup_rel} (link)")
+
+    total_checked = total_to_check
+
+    if not missing and not mismatches:
+        print(f"\r  {C.GREEN}✓ Verified: all {total_checked} files OK on remote{C.RESET}               ")
+        return True
+    else:
+        print(f"\r  {C.RED}✗ Verification failed:{C.RESET}")
+        for m in missing[:10]:
+            print(f"    {C.RED}MISSING: {m}{C.RESET}")
+        for rel, exp, act in mismatches[:10]:
+            print(f"    {C.RED}SIZE MISMATCH: {rel} ({exp} → {act}){C.RESET}")
+        shown = min(len(missing), 10) + min(len(mismatches), 10)
+        remain = len(missing) + len(mismatches) - shown
+        if remain > 0:
+            print(f"    ... and {remain} more")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # VERIFICATION
 # ════════════════════════════════════════════════════════════════════════════
 def verify_copy(entries, link_map, dst_root):
@@ -1131,11 +2073,14 @@ def verify_copy(entries, link_map, dst_root):
         expected[dup_rel] = None  # links: just check existence
 
     # Single walk of destination — much faster than per-file stat on USB
+    # Use _long_path for walk (to see long-path files) but strip it for relpath
+    walk_root = _long_path(dst_root)
+    rel_base = _strip_long_path(walk_root)
     found = {}
-    for root, dirs, files in os.walk(dst_root):
+    for root, dirs, files in os.walk(walk_root):
         for fname in files:
             full = os.path.join(root, fname)
-            rel = os.path.relpath(full, dst_root)
+            rel = os.path.relpath(_strip_long_path(full), rel_base).replace(os.sep, "/")
             if rel in expected:
                 try:
                     found[rel] = os.path.getsize(full)
@@ -1276,6 +2221,600 @@ def filter_unchanged(entries, link_map, dst_root, threads=DEFAULT_THREADS):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# REMOTE SOURCE — scan, hash, and copy FROM a remote machine
+# ════════════════════════════════════════════════════════════════════════════
+
+def scan_remote_source(ssh, src_root, excludes=None):
+    """Scan remote source tree via SSH find. Returns (entries, errors)."""
+    print(f"  {C.DIM}Scanning remote source...{C.RESET}", end="", flush=True)
+
+    exclude_names = {TAR_BUNDLE_NAME, DEDUP_DB_NAME, REMOTE_MANIFEST_NAME}
+    if excludes:
+        for ex in excludes:
+            exclude_names.add(ex)
+
+    exclude_args = " ".join(
+        f"-not -name {shlex.quote(n)}" for n in exclude_names
+    )
+
+    if ssh.caps.get("gnu_find"):
+        cmd = (f'find {shlex.quote(src_root)} -type f {exclude_args} '
+               f'-printf "%s\\t%p\\n" 2>/dev/null')
+    else:
+        cmd = (f'find {shlex.quote(src_root)} -type f {exclude_args} '
+               f'-exec stat -c "%s %n" {{}} + 2>/dev/null || '
+               f'find {shlex.quote(src_root)} -type f {exclude_args} '
+               f'-exec stat -f "%z %N" {{}} + 2>/dev/null')
+
+    out, _, rc = ssh.exec_cmd(cmd, timeout=600)
+
+    entries = []
+    errors = []
+    count = 0
+
+    for line in out.strip().split("\n"):
+        if not line:
+            continue
+        sep = "\t" if ssh.caps.get("gnu_find") else None
+        parts = line.split(sep, 1) if sep else line.split(None, 1)
+        if len(parts) == 2:
+            try:
+                size = int(parts[0])
+                path = parts[1].strip()
+                rel = posixpath.relpath(path, src_root)
+                entries.append(FileEntry(
+                    src=path, rel=rel, size=size,
+                    physical_offset=0, content_hash=None,
+                ))
+                count += 1
+                if count % 5000 == 0:
+                    print(f"\r  {C.DIM}Scanning... {count} files{C.RESET}",
+                          end="", flush=True)
+            except (ValueError, TypeError):
+                errors.append((parts[1].strip() if len(parts) > 1 else "?", "parse error"))
+
+    print(f"\r  {C.GREEN}Found {len(entries)} files on remote{C.RESET}                    ")
+    if errors:
+        print(f"  {C.YELLOW}Skipped {len(errors)} problematic entries{C.RESET}")
+
+    return entries, errors
+
+
+def deduplicate_remote_source(entries, ssh, src_root, threads=DEFAULT_THREADS):
+    """
+    Dedup by hashing files on the remote source machine.
+    Returns (unique_entries, link_map, saved_bytes).
+    """
+    total = len(entries)
+    print(f"  Hashing {total} files on remote source...")
+
+    rel_paths = [e.rel for e in entries]
+    remote_hashes = remote_hash_files(ssh, src_root, rel_paths)
+
+    hashed = 0
+    hashed_entries = []
+    for e in entries:
+        h = remote_hashes.get(e.rel)
+        hashed_entries.append(FileEntry(e.src, e.rel, e.size, e.physical_offset, h))
+        if h:
+            hashed += 1
+
+    print(f"  {C.GREEN}Hashed {hashed}/{total} files on remote{C.RESET}")
+
+    if not remote_hashes:
+        print(f"  {C.YELLOW}Could not hash on remote — skipping dedup{C.RESET}")
+        return entries, {}, 0
+
+    hash_groups = defaultdict(list)
+    unique_entries = []
+
+    for e in hashed_entries:
+        if e.content_hash:
+            hash_groups[(e.size, e.content_hash)].append(e)
+        else:
+            unique_entries.append(e)
+
+    link_map = {}
+    saved_bytes = 0
+
+    for key, group in hash_groups.items():
+        unique_entries.append(group[0])
+        for dup in group[1:]:
+            link_map[dup.rel] = group[0].rel
+            saved_bytes += dup.size
+
+    dup_count = len(link_map)
+    print(f"  {C.GREEN}Dedup complete:{C.RESET}")
+    print(f"    Unique files:    {C.BOLD}{len(unique_entries)}{C.RESET}")
+    print(f"    Duplicates:      {C.BOLD}{dup_count}{C.RESET} "
+          f"({fmt_pct(dup_count, len(entries))} of files)")
+    print(f"    Space saved:     {C.GREEN}{C.BOLD}{fmt_size(saved_bytes)}{C.RESET}")
+
+    return unique_entries, link_map, saved_bytes
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# REMOTE → LOCAL COPY
+# ════════════════════════════════════════════════════════════════════════════
+
+def copy_individual_remote_to_local(entries, ssh, dst_root, progress, buf_size):
+    """Download large files from remote to local via SFTP."""
+    sftp = ssh.open_sftp()
+
+    for entry in entries:
+        remote_path = entry.src
+        dst_path = _long_path(os.path.join(dst_root, entry.rel))
+
+        try:
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+            if entry.size == 0:
+                with open(dst_path, "wb"):
+                    pass
+                progress.update(0, 1)
+                progress.display()
+                continue
+
+            with sftp.open(remote_path, "rb") as fin, open(dst_path, "wb") as fout:
+                fin.prefetch(entry.size)  # pipeline reads for much higher throughput
+                while True:
+                    data = fin.read(buf_size)
+                    if not data:
+                        break
+                    fout.write(data)
+                    progress.update(len(data))
+                    progress.display()
+
+            try:
+                rstat = sftp.stat(remote_path)
+                os.utime(dst_path, (rstat.st_atime, rstat.st_mtime))
+            except (OSError, IOError):
+                pass
+
+            progress.update(0, 1)
+
+        except (OSError, IOError) as e:
+            print(f"\n  {C.RED}Error: {entry.rel}: {e}{C.RESET}")
+            progress.update(entry.size, 1)
+
+
+class _ProgressTarExtractor:
+    """Extract tar members with byte-level progress for large files."""
+
+    def __init__(self, tar, dst_root, progress):
+        self._tar = tar
+        self._dst_root = dst_root
+        self._progress = progress
+        self.extracted = 0
+
+    # Maximum bytes to extract from a single tar member (50 GB safety limit)
+    MAX_MEMBER_SIZE = 50 * 1024 * 1024 * 1024
+
+    def extract_member(self, member):
+        """Extract one member. Large files get mid-extraction progress updates."""
+        # Directories: extract silently, don't count in progress
+        if member.isdir():
+            # Validate even directories
+            check = _validate_tar_member(member, self._dst_root)
+            if check is not True:
+                return check
+            result = _safe_tar_extract(self._tar, member, self._dst_root)
+            return True
+
+        # Full validation (rejects symlinks, devices, hard links, etc.)
+        check = _validate_tar_member(member, self._dst_root)
+        if check is not True:
+            return check
+
+        # Empty or small file — extract normally, update after
+        if member.size < 1 * 1024 * 1024:
+            result = _safe_tar_extract(self._tar, member, self._dst_root)
+            if result is True:
+                self.extracted += 1
+                self._progress.update(member.size, 1)
+                self._progress.display()
+            return result
+
+        # Large file — extract with progress updates during write
+        # Validate with plain paths, use _long_path only for I/O
+        resolved = os.path.realpath(os.path.join(self._dst_root, member.name))
+        real_dst = os.path.realpath(self._dst_root)
+        if not resolved.startswith(real_dst + os.sep) and resolved != real_dst:
+            return "blocked: resolves outside destination"
+
+        io_path = _long_path(resolved)
+        os.makedirs(os.path.dirname(io_path), exist_ok=True)
+        fileobj = self._tar.extractfile(member)
+        if fileobj is None:
+            return "blocked: cannot extract"
+
+        written = 0
+        try:
+            with open(io_path, "wb") as fout:
+                while True:
+                    chunk = fileobj.read(1048576)  # 1 MB
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > self.MAX_MEMBER_SIZE:
+                        fout.close()
+                        os.remove(io_path)
+                        return f"blocked: exceeds {self.MAX_MEMBER_SIZE // (1024**3)} GB safety limit"
+                    fout.write(chunk)
+                    self._progress.update(len(chunk))
+                    self._progress.display()
+        finally:
+            fileobj.close()
+
+        # Preserve mtime
+        try:
+            os.utime(io_path, (member.mtime, member.mtime))
+        except OSError:
+            pass
+
+        self.extracted += 1
+        self._progress.update(0, 1)  # file count only, bytes already reported
+        self._progress.display()
+        return True
+
+
+def _stream_tar_batch_from_remote(batch, ssh, src_root, dst_root, progress):
+    """Download one batch of files via tar stream with streaming extraction."""
+    import threading
+
+    file_list = "\0".join(e.rel for e in batch) + "\0"
+    file_list_bytes = file_list.encode("utf-8")
+
+    channel = ssh.open_channel()
+    channel.exec_command(
+        f"cd {shlex.quote(src_root)} && tar cf - --null -T /dev/stdin"
+    )
+
+    def _send_file_list():
+        try:
+            chunk_size = 65536
+            for i in range(0, len(file_list_bytes), chunk_size):
+                channel.sendall(file_list_bytes[i:i + chunk_size])
+        finally:
+            channel.shutdown_write()
+
+    sender = threading.Thread(target=_send_file_list, daemon=True)
+    sender.start()
+
+    # Streaming extraction with byte-level progress for large files (no temp file)
+    os.makedirs(dst_root, exist_ok=True)
+    reader = channel.makefile("rb")
+    extracted = 0
+    try:
+        with tarfile.open(fileobj=reader, mode="r|") as tar:
+            extractor = _ProgressTarExtractor(tar, dst_root, progress)
+            for member in tar:
+                try:
+                    result = extractor.extract_member(member)
+                    if result is not True:
+                        print(f"\n  {C.YELLOW}Skipped: {member.name}: {result}{C.RESET}")
+                except (OSError, tarfile.TarError) as e:
+                    print(f"\n  {C.YELLOW}Extract error: {member.name}: {e}{C.RESET}")
+            extracted = extractor.extracted
+    except (OSError, tarfile.TarError) as e:
+        print(f"\n  {C.RED}Tar extraction failed: {e}{C.RESET}")
+    finally:
+        reader.close()
+
+    sender.join(timeout=10)
+    rc = channel.recv_exit_status()
+    if rc != 0:
+        stderr = channel.recv_stderr(4096).decode("utf-8", errors="replace")
+        print(f"\n  {C.YELLOW}Remote tar exited {rc}: {stderr[:200]}{C.RESET}")
+    channel.close()
+    return extracted
+
+
+def copy_block_stream_remote_to_local(entries, ssh, src_root, dst_root, progress):
+    """Download files from remote via chunked tar streams with streaming extraction."""
+    if not entries:
+        return
+
+    if not ssh.caps.get("tar"):
+        print(f"  {C.YELLOW}Remote has no tar — falling back to SFTP{C.RESET}")
+        copy_individual_remote_to_local(entries, ssh, dst_root, progress, 1 * 1024 * 1024)
+        return
+
+    safe_entries = [e for e in entries if _validate_rel_path(e.rel) is True]
+    if len(safe_entries) < len(entries):
+        print(f"  {C.YELLOW}Skipped {len(entries) - len(safe_entries)} entries with unsafe paths{C.RESET}")
+
+    total_size = sum(e.size for e in safe_entries)
+    batches = _batch_by_size(safe_entries)
+    print(f"  Streaming {len(safe_entries)} files ({fmt_size(total_size)}) in "
+          f"{len(batches)} batch{'es' if len(batches) != 1 else ''} from remote...")
+
+    total_extracted = 0
+    for i, batch in enumerate(batches):
+        batch_size = sum(e.size for e in batch)
+        if len(batches) > 1:
+            print(f"\n  {C.DIM}Batch {i+1}/{len(batches)}: {len(batch)} files "
+                  f"({fmt_size(batch_size)}){C.RESET}")
+        total_extracted += _stream_tar_batch_from_remote(
+            batch, ssh, src_root, dst_root, progress)
+
+    print(f"\n  {C.GREEN}Extracted {total_extracted} files{C.RESET}")
+
+
+def copy_hybrid_remote_to_local(entries, ssh, src_root, dst_root, progress, buf_size):
+    """Remote-to-local: tar stream for all files (much faster than SFTP)."""
+    total_size = sum(e.size for e in entries)
+
+    if ssh.caps.get("tar"):
+        print(f"  Strategy: tar stream for all {C.BOLD}{len(entries)}{C.RESET} files "
+              f"({C.BOLD}{fmt_size(total_size)}{C.RESET})")
+        print()
+        copy_block_stream_remote_to_local(entries, ssh, src_root, dst_root, progress)
+    else:
+        # Fallback: SFTP for everything if tar not available
+        small, large = split_by_size(entries)
+        small_size = sum(e.size for e in small)
+        large_size = sum(e.size for e in large)
+
+        print(f"  Strategy (no remote tar — using SFTP):")
+        print(f"    Small files (<1MB): {C.BOLD}{len(small)}{C.RESET} files, "
+              f"{C.BOLD}{fmt_size(small_size)}{C.RESET}")
+        print(f"    Large files (≥1MB): {C.BOLD}{len(large)}{C.RESET} files, "
+              f"{C.BOLD}{fmt_size(large_size)}{C.RESET}")
+        print()
+        copy_individual_remote_to_local(entries, ssh, dst_root, progress, buf_size)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# REMOTE → REMOTE COPY — relay data through local machine
+# ════════════════════════════════════════════════════════════════════════════
+
+def copy_individual_r2r(entries, src_ssh, dst_ssh, dst_root, progress, buf_size):
+    """Remote-to-remote SFTP relay for large files (src → local buf → dst)."""
+    src_sftp = src_ssh.open_sftp()
+    dst_sftp = dst_ssh.open_sftp()
+
+    for entry in entries:
+        remote_src_path = entry.src
+        remote_dst_path = posixpath.join(dst_root, entry.rel)
+
+        try:
+            if entry.size == 0:
+                with dst_sftp.open(remote_dst_path, "w"):
+                    pass
+                progress.update(0, 1)
+                progress.display()
+                continue
+
+            with src_sftp.open(remote_src_path, "rb") as fin:
+                fin.prefetch(entry.size)  # pipeline reads
+                with dst_sftp.open(remote_dst_path, "wb") as fout:
+                    fout.set_pipelined(True)
+                    while True:
+                        data = fin.read(buf_size)
+                        if not data:
+                            break
+                        fout.write(data)
+                        progress.update(len(data))
+                        progress.display()
+
+            # Preserve timestamps
+            try:
+                rstat = src_sftp.stat(remote_src_path)
+                dst_sftp.utime(remote_dst_path, (rstat.st_atime, rstat.st_mtime))
+            except (OSError, IOError):
+                pass
+
+            progress.update(0, 1)
+
+        except (OSError, IOError) as e:
+            print(f"\n  {C.RED}Error: {entry.rel}: {e}{C.RESET}")
+            progress.update(entry.size, 1)
+
+
+def _stream_tar_batch_r2r(batch, src_ssh, dst_ssh, src_root, dst_root, progress):
+    """Relay one batch of files via tar pipe: src tar cf → local → dst tar xf."""
+    import threading
+
+    safe_entries = [e for e in batch if _validate_rel_path(e.rel) is True]
+    if not safe_entries:
+        return 0
+    file_list = "\0".join(e.rel for e in safe_entries) + "\0"
+    file_list_bytes = file_list.encode("utf-8")
+
+    # Source: tar producer
+    src_chan = src_ssh.open_channel()
+    src_chan.exec_command(
+        f"cd {shlex.quote(src_root)} && tar cf - --null -T /dev/stdin"
+    )
+
+    def _send_file_list():
+        try:
+            chunk_size = 65536
+            for i in range(0, len(file_list_bytes), chunk_size):
+                src_chan.sendall(file_list_bytes[i:i + chunk_size])
+        finally:
+            src_chan.shutdown_write()
+
+    sender = threading.Thread(target=_send_file_list, daemon=True)
+    sender.start()
+
+    # Destination: tar consumer
+    dst_chan = dst_ssh.open_channel()
+    dst_chan.exec_command(
+        f"tar xf - --no-same-owner --no-same-permissions -C {shlex.quote(dst_root)}"
+    )
+
+    # Relay: src → dst
+    relayed = 0
+    while True:
+        data = src_chan.recv(1048576)
+        if not data:
+            break
+        dst_chan.sendall(data)
+        relayed += len(data)
+
+    dst_chan.shutdown_write()
+    sender.join(timeout=10)
+
+    src_rc = src_chan.recv_exit_status()
+    dst_rc = dst_chan.recv_exit_status()
+
+    if src_rc != 0:
+        print(f"\n  {C.YELLOW}Source tar exited {src_rc}{C.RESET}")
+    if dst_rc != 0:
+        stderr = dst_chan.recv_stderr(4096).decode("utf-8", errors="replace")
+        print(f"\n  {C.YELLOW}Dest tar exited {dst_rc}: {stderr[:200]}{C.RESET}")
+
+    batch_size = sum(e.size for e in safe_entries)
+    progress.update(batch_size, len(safe_entries))
+    progress.display()
+
+    src_chan.close()
+    dst_chan.close()
+    return relayed
+
+
+def copy_block_stream_r2r(entries, src_ssh, dst_ssh, src_root, dst_root, progress):
+    """Remote-to-remote tar pipe relay in chunked batches."""
+    if not entries:
+        return
+
+    has_src_tar = src_ssh.caps.get("tar")
+    has_dst_tar = dst_ssh.caps.get("tar")
+
+    if not has_src_tar or not has_dst_tar:
+        print(f"  {C.YELLOW}Tar not available on both ends — falling back to SFTP relay{C.RESET}")
+        copy_individual_r2r(entries, src_ssh, dst_ssh, dst_root, progress, 1 * 1024 * 1024)
+        return
+
+    total_size = sum(e.size for e in entries)
+    batches = _batch_by_size(entries)
+    print(f"  Piping {len(entries)} files ({fmt_size(total_size)}) in "
+          f"{len(batches)} batch{'es' if len(batches) != 1 else ''} via tar relay...")
+
+    total_relayed = 0
+    for i, batch in enumerate(batches):
+        batch_size = sum(e.size for e in batch)
+        if len(batches) > 1:
+            print(f"\n  {C.DIM}Batch {i+1}/{len(batches)}: {len(batch)} files "
+                  f"({fmt_size(batch_size)}){C.RESET}")
+        total_relayed += _stream_tar_batch_r2r(
+            batch, src_ssh, dst_ssh, src_root, dst_root, progress)
+
+    print(f"\n  {C.GREEN}Tar relay: {fmt_size(total_relayed)} piped ({len(entries)} files){C.RESET}")
+
+
+def copy_hybrid_r2r(entries, src_ssh, dst_ssh, src_root, dst_root, progress, buf_size):
+    """Remote-to-remote: tar pipe relay for all files (much faster than SFTP)."""
+    total_size = sum(e.size for e in entries)
+
+    # Create all directories on dest first
+    ensure_remote_dirs(dst_ssh, dst_root, entries)
+
+    has_tar = src_ssh.caps.get("tar") and dst_ssh.caps.get("tar")
+    if has_tar:
+        print(f"  Strategy: tar pipe relay for all {C.BOLD}{len(entries)}{C.RESET} files "
+              f"({C.BOLD}{fmt_size(total_size)}{C.RESET})")
+        print()
+        copy_block_stream_r2r(entries, src_ssh, dst_ssh, src_root, dst_root, progress)
+    else:
+        # Fallback: SFTP relay for everything
+        print(f"  Strategy (tar not available — using SFTP relay):")
+        print(f"    {C.BOLD}{len(entries)}{C.RESET} files, "
+              f"{C.BOLD}{fmt_size(total_size)}{C.RESET}")
+        print()
+        copy_individual_r2r(entries, src_ssh, dst_ssh, dst_root, progress, buf_size)
+
+
+def filter_unchanged_remote_to_local(entries, link_map, src_ssh, src_root, dst_root, threads=DEFAULT_THREADS):
+    """
+    Incremental check for remote→local: compare remote source files
+    against existing local destination files.
+    Returns (to_copy, to_link, skipped_count, skipped_bytes).
+    """
+    print(f"  {C.DIM}Checking destination for existing files...{C.RESET}", end="", flush=True)
+
+    need_copy = []
+    need_hash = []
+    skipped = []
+    skipped_bytes = 0
+
+    for entry in entries:
+        dst_path = os.path.join(dst_root, entry.rel)
+
+        if not os.path.exists(dst_path):
+            need_copy.append(entry)
+            continue
+
+        try:
+            dst_size = os.path.getsize(dst_path)
+        except OSError:
+            need_copy.append(entry)
+            continue
+
+        if dst_size != entry.size:
+            need_copy.append(entry)
+        else:
+            need_hash.append(entry)
+
+    print(f"\r  {C.DIM}Quick check: {len(need_copy)} new/changed, "
+          f"{len(need_hash)} same-size need hash check{C.RESET}          ")
+
+    if not need_hash:
+        return need_copy, link_map, 0, 0
+
+    # Hash dest files locally and source files on remote
+    print(f"  {C.DIM}Hashing {len(need_hash)} files to check for changes...{C.RESET}", end="", flush=True)
+
+    # Hash local dest files
+    dst_hashes = [None] * len(need_hash)
+
+    def hash_dst(idx):
+        entry = need_hash[idx]
+        dst_path = os.path.join(dst_root, entry.rel)
+        dst_hashes[idx] = hash_file_sha256(dst_path)
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [pool.submit(hash_dst, i) for i in range(len(need_hash))]
+        for f in as_completed(futures):
+            f.result()
+
+    # Hash remote source files
+    remote_h = remote_hash_files(src_ssh, src_root, [e.rel for e in need_hash])
+
+    for i, entry in enumerate(need_hash):
+        rh = remote_h.get(entry.rel)
+        dh = dst_hashes[i]
+        if rh and dh and rh == dh:
+            skipped.append(entry)
+            skipped_bytes += entry.size
+        else:
+            need_copy.append(entry)
+
+    # Filter link_map
+    new_link_map = {}
+    skipped_links = 0
+    for dup_rel, canonical_rel in link_map.items():
+        dst_path = os.path.join(dst_root, dup_rel)
+        if os.path.exists(dst_path):
+            skipped_links += 1
+        else:
+            new_link_map[dup_rel] = canonical_rel
+
+    print(f"\r  {C.GREEN}Incremental check complete:{C.RESET}                              ")
+    print(f"    To copy:   {C.BOLD}{len(need_copy)}{C.RESET} files "
+          f"({fmt_size(sum(e.size for e in need_copy))})")
+    print(f"    Skipped:   {C.BOLD}{len(skipped)}{C.RESET} files unchanged "
+          f"({C.GREEN}{fmt_size(skipped_bytes)}{C.RESET})")
+    if skipped_links:
+        print(f"    Links:     {C.BOLD}{skipped_links}{C.RESET} already exist, "
+              f"{C.BOLD}{len(new_link_map)}{C.RESET} to create")
+
+    return need_copy, new_link_map, len(skipped) + skipped_links, skipped_bytes
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
 def main():
@@ -1304,74 +2843,149 @@ def main():
                         help="Exclude files/dirs by name (can use multiple times)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable persistent hash cache (cross-run dedup database)")
+    # Destination SSH options
+    parser.add_argument("--ssh-dst-port", "--ssh-port", type=int, default=22,
+                        dest="ssh_port",
+                        help="SSH port for remote destination (default: 22)")
+    parser.add_argument("--ssh-dst-key", "--ssh-key", default=None,
+                        dest="ssh_key",
+                        help="Path to SSH private key for remote destination")
+    parser.add_argument("--ssh-dst-password", "--ssh-password", action="store_true",
+                        dest="ssh_password",
+                        help="Prompt for SSH password for remote destination")
+    parser.add_argument("-z", "--compress", action="store_true",
+                        help="Enable SSH compression (good for slow links)")
+    # Source SSH options
+    parser.add_argument("--ssh-src-port", "--src-port", type=int, default=22,
+                        dest="src_port",
+                        help="SSH port for remote source (default: 22)")
+    parser.add_argument("--ssh-src-key", "--src-key", default=None,
+                        dest="src_key",
+                        help="Path to SSH private key for remote source")
+    parser.add_argument("--ssh-src-password", "--src-password", action="store_true",
+                        dest="src_password",
+                        help="Prompt for SSH password for remote source")
     args = parser.parse_args()
 
     src_arg = args.source
-    dst = os.path.abspath(args.destination)
     buf_size = args.buffer * 1024 * 1024
 
-    # ── Resolve source: directory, single file, or glob pattern ──────
-    src_mode = None  # "dir", "file", or "glob"
-    glob_files = []
+    # ── Detect remote source and destination ──────────────────────────
+    src_remote = parse_remote_path(src_arg)
+    dst_remote = parse_remote_path(args.destination)
 
-    src = os.path.abspath(src_arg)
-    if os.path.isdir(src):
-        src_mode = "dir"
-    elif os.path.isfile(src):
-        src_mode = "file"
-    else:
-        # Try glob expansion (handles wildcards like *.zip)
-        glob_files = sorted(globmod.glob(src_arg))
-        if not glob_files:
-            # Also try with abspath
-            glob_files = sorted(globmod.glob(src))
-        # Filter to files only
-        glob_files = [f for f in glob_files if os.path.isfile(f)]
-        if glob_files:
-            src_mode = "glob"
-        else:
-            print(f"{C.RED}Error: Source '{src_arg}' — no matching files or directory found{C.RESET}")
+    if src_remote:
+        src_remote = src_remote._replace(port=args.src_port)
+    if dst_remote:
+        dst_remote = dst_remote._replace(port=args.ssh_port)
+
+    # Validate SSH key paths early
+    for label, keypath in [("--ssh-key", args.ssh_key), ("--src-key", args.src_key)]:
+        if keypath and not os.path.isfile(keypath):
+            print(f"{C.RED}Error: {label} file not found: {keypath}{C.RESET}")
             sys.exit(1)
 
-    if src_mode == "glob":
-        src_display = src_arg
-        # Use common parent as the "source root" for relative paths
-        src = os.path.commonpath([os.path.abspath(f) for f in glob_files])
-        if os.path.isfile(src):
-            src = os.path.dirname(src)
-    elif src_mode == "file":
-        src_display = src
+    # Keep 'remote' alias for backward compat with existing local→remote code
+    remote = dst_remote
+
+    if dst_remote:
+        dst = dst_remote.path
     else:
-        src_display = src
+        dst = os.path.abspath(args.destination)
+
+    # ── Resolve source ───────────────────────────────────────────────
+    src_mode = None  # "dir", "file", "glob", or "remote"
+    glob_files = []
+
+    if src_remote:
+        src = src_remote.path
+        src_mode = "remote"
+        src_display = f"{src_remote.user}@{src_remote.host}:{src}"
+    else:
+        src = os.path.abspath(src_arg)
+        if os.path.isdir(src):
+            src_mode = "dir"
+        elif os.path.isfile(src):
+            src_mode = "file"
+        else:
+            # Try glob expansion (handles wildcards like *.zip)
+            glob_files = sorted(globmod.glob(src_arg))
+            if not glob_files:
+                glob_files = sorted(globmod.glob(src))
+            glob_files = [f for f in glob_files if os.path.isfile(f)]
+            if glob_files:
+                src_mode = "glob"
+            else:
+                print(f"{C.RED}Error: Source '{src_arg}' — no matching files or directory found{C.RESET}")
+                sys.exit(1)
+
+        if src_mode == "glob":
+            src_display = src_arg
+            src = os.path.commonpath([os.path.abspath(f) for f in glob_files])
+            if os.path.isfile(src):
+                src = os.path.dirname(src)
+        elif src_mode == "file":
+            src_display = src
+        else:
+            src_display = src
 
     banner("FAST BLOCK-ORDER COPY")
     print(f"  Source:      {C.BOLD}{src_display}{C.RESET}")
-    if src_mode == "glob":
+    if src_mode == "remote":
+        print(f"               {C.DIM}(SSH remote, port {src_remote.port}){C.RESET}")
+    elif src_mode == "glob":
         print(f"               {C.DIM}{len(glob_files)} files matched{C.RESET}")
     elif src_mode == "file":
         print(f"               {C.DIM}(single file){C.RESET}")
-    print(f"  Destination: {C.BOLD}{dst}{C.RESET}")
+    if dst_remote:
+        print(f"  Destination: {C.BOLD}{dst_remote.user}@{dst_remote.host}:{dst}{C.RESET}")
+        print(f"               {C.DIM}(SSH remote, port {dst_remote.port}){C.RESET}")
+    else:
+        print(f"  Destination: {C.BOLD}{dst}{C.RESET}")
+    if src_remote and dst_remote:
+        print(f"  Mode:        {C.CYAN}remote → remote (relay through local){C.RESET}")
+    elif src_remote:
+        print(f"  Mode:        {C.CYAN}remote → local{C.RESET}")
+    elif dst_remote:
+        print(f"  Mode:        {C.CYAN}local → remote{C.RESET}")
     print(f"  Buffer:      {args.buffer} MB")
     print(f"  Dedup:       {'disabled' if args.no_dedup else 'enabled'}")
-    print(f"  Hash cache:  {'disabled' if args.no_cache else 'enabled'}")
+    if not src_remote and not dst_remote:
+        print(f"  Hash cache:  {'disabled' if args.no_cache else 'enabled'}")
     print(f"  Overwrite:   {'always' if args.overwrite else 'skip identical'}")
+    if (src_remote or dst_remote) and args.compress:
+        print(f"  Compression: {C.GREEN}enabled{C.RESET}")
     print(f"  Platform:    {_system}")
     print()
+
+    # ── Connect to remote source if needed ─────────────────────────────
+    src_ssh = None
+    if src_remote:
+        banner("SSH — Connecting to source")
+        src_password = None
+        if args.src_password:
+            src_password = getpass.getpass(f"Password for {src_remote.user}@{src_remote.host}: ")
+        src_ssh = SSHConnection(src_remote, port=src_remote.port, key_path=args.src_key,
+                                password=src_password, compress=args.compress,
+                                ).connect()
+        print(f"  {C.GREEN}Connected to {src_remote.user}@{src_remote.host}:{src_remote.port}{C.RESET}")
+        caps = [k for k, v in src_ssh.caps.items() if v]
+        print(f"  {C.DIM}Remote tools: {', '.join(caps) or 'none detected'}{C.RESET}")
 
     # ── Phase 1: Scan ─────────────────────────────────────────────────
     banner("Phase 1 — Scanning source")
 
-    if src_mode == "file":
-        # Single file — build entry directly
+    if src_mode == "remote":
+        entries, errors = scan_remote_source(src_ssh, src, args.exclude)
+    elif src_mode == "file":
         fname = os.path.basename(src)
         sz = os.path.getsize(src)
         entries = [FileEntry(src=src, rel=fname, size=sz,
                              physical_offset=0, content_hash=None)]
         errors = []
         print(f"  {C.GREEN}Found 1 file{C.RESET} ({fmt_size(sz)})")
-        src = os.path.dirname(src)  # parent becomes "source root" for dst layout
+        src = os.path.dirname(src)
     elif src_mode == "glob":
-        # Glob — build entries from matched files
         entries = []
         errors = []
         for fpath in glob_files:
@@ -1385,10 +2999,12 @@ def main():
                 errors.append((abs_f, str(e)))
         print(f"  {C.GREEN}Found {len(entries)} files{C.RESET}")
     else:
-        entries, errors = scan_source(src, dst, args.exclude)
+        entries, errors = scan_source(src, dst if not dst_remote else None, args.exclude)
 
     if not entries:
         print(f"  {C.YELLOW}No files found.{C.RESET}")
+        if src_ssh:
+            src_ssh.close()
         sys.exit(0)
 
     total_size = sum(e.size for e in entries)
@@ -1398,26 +3014,485 @@ def main():
           f"{C.BOLD}{total_files}{C.RESET} files  "
           f"(avg {fmt_size(avg_size)}/file)")
 
-    # ── Open dedup database ──────────────────────────────────────────
+    # ── Phase 2: Deduplication ───────────────────────────────────────
     dedup_db = None
-    if not args.no_dedup and not args.no_cache:
+    if not src_remote and not dst_remote and not args.no_dedup and not args.no_cache:
         os.makedirs(dst, exist_ok=True)
         try:
             dedup_db = DedupDB(dst)
         except Exception as e:
             print(f"  {C.YELLOW}Warning: could not open hash cache: {e}{C.RESET}")
 
-    # ── Phase 2: Deduplication ────────────────────────────────────────
     link_map = {}
     saved_bytes = 0
     copy_entries = entries
 
     if not args.no_dedup:
         banner("Phase 2 — Deduplication")
-        copy_entries, link_map, saved_bytes = deduplicate(entries, args.threads, dedup_db)
+        if src_remote:
+            copy_entries, link_map, saved_bytes = deduplicate_remote_source(
+                entries, src_ssh, src, args.threads)
+        else:
+            copy_entries, link_map, saved_bytes = deduplicate(entries, args.threads, dedup_db)
 
     unique_size = sum(e.size for e in copy_entries)
 
+    # ══════════════════════════════════════════════════════════════════
+    # REMOTE → REMOTE FLOW
+    # ══════════════════════════════════════════════════════════════════
+    if src_remote and dst_remote:
+        dst_ssh = None
+        try:
+            # ── Connect to destination ───────────────────────────────
+            banner("SSH — Connecting to destination")
+            dst_password = None
+            if args.ssh_password:
+                dst_password = getpass.getpass(f"Password for {dst_remote.user}@{dst_remote.host}: ")
+            dst_ssh = SSHConnection(dst_remote, port=dst_remote.port, key_path=args.ssh_key,
+                                    password=dst_password, compress=args.compress,
+                                    ).connect()
+            print(f"  {C.GREEN}Connected to {dst_remote.user}@{dst_remote.host}:{dst_remote.port}{C.RESET}")
+            caps = [k for k, v in dst_ssh.caps.items() if v]
+            print(f"  {C.DIM}Remote tools: {', '.join(caps) or 'none detected'}{C.RESET}")
+
+            # ── Phase 2b: Incremental check against remote dest ──────
+            skipped_count = 0
+            skipped_bytes = 0
+
+            if not args.overwrite:
+                banner("Phase 2b — Remote incremental check")
+                try:
+                    copy_entries, link_map, skipped_count, skipped_bytes = \
+                        filter_unchanged_remote(copy_entries, link_map, dst_ssh, dst)
+                    unique_size = sum(e.size for e in copy_entries)
+                except Exception as e:
+                    print(f"  {C.YELLOW}Incremental check failed ({e}) — copying all files{C.RESET}")
+                    # Reconnect destination in case the channel died
+                    try:
+                        dst_ssh.close()
+                    except Exception:
+                        pass
+                    dst_ssh = SSHConnection(dst_remote, port=dst_remote.port, key_path=args.ssh_key,
+                                            password=dst_password, compress=args.compress,
+                                            ).connect()
+
+                if not copy_entries and not link_map:
+                    banner("DONE — Nothing to copy")
+                    print(f"  All {skipped_count} files are already up to date on remote.")
+                    print()
+                    src_ssh.close()
+                    dst_ssh.close()
+                    sys.exit(0)
+
+            # ── Phase 3: Space check on dest ─────────────────────────
+            banner("Phase 3 — Space check (remote destination)")
+            required = unique_size
+            print(f"  Data to write: {C.BOLD}{fmt_size(required)}{C.RESET}"
+                  + (f" (after dedup saved {fmt_size(saved_bytes)})" if saved_bytes > 0 else ""))
+
+            if not check_remote_space(dst_ssh, dst, required, args.force):
+                src_ssh.close()
+                dst_ssh.close()
+                sys.exit(1)
+
+            if args.dry_run:
+                small, large = split_by_size(copy_entries)
+                small_sz = sum(e.size for e in small)
+                large_sz = sum(e.size for e in large)
+                print(f"\n  {C.YELLOW}DRY RUN — Copy strategy:{C.RESET}\n")
+                print(f"    Small files (<1MB): {C.BOLD}{len(small)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(small_sz)}{C.RESET} → tar pipe relay")
+                print(f"    Large files (≥1MB): {C.BOLD}{len(large)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(large_sz)}{C.RESET} → SFTP relay")
+                if link_map:
+                    print(f"\n  Plus {len(link_map)} duplicate files to be linked on remote")
+                print(f"\n  Unique data: {fmt_size(unique_size)}")
+                src_ssh.close()
+                dst_ssh.close()
+                sys.exit(0)
+
+            # ── Phase 5: Remote-to-remote copy ───────────────────────
+            banner("Phase 5 — Remote-to-remote copy (relay)")
+
+            # Check if buffer fits in available RAM
+            try:
+                import psutil
+                avail = psutil.virtual_memory().available
+            except ImportError:
+                avail = None
+                if _system == "Linux":
+                    try:
+                        with open("/proc/meminfo") as f:
+                            for line in f:
+                                if line.startswith("MemAvailable:"):
+                                    avail = int(line.split()[1]) * 1024
+                                    break
+                    except (OSError, ValueError):
+                        pass
+                elif _system == "Darwin":
+                    try:
+                        import subprocess
+                        # Get actual page size (4KB Intel, 16KB Apple Silicon)
+                        page_size = int(subprocess.check_output(
+                            ["sysctl", "-n", "hw.pagesize"], text=True, timeout=5
+                        ).strip())
+                        out = subprocess.check_output(
+                            ["vm_stat"], text=True, timeout=5
+                        )
+                        free_pages = 0
+                        for line in out.splitlines():
+                            if "Pages free:" in line or "Pages speculative:" in line:
+                                free_pages += int(line.split()[-1].rstrip("."))
+                        avail = free_pages * page_size
+                    except Exception:
+                        pass
+                elif _system == "Windows":
+                    try:
+                        import ctypes
+                        class MEMORYSTATUSEX(ctypes.Structure):
+                            _fields_ = [
+                                ("dwLength", ctypes.c_ulong),
+                                ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong),
+                                ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong),
+                                ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong),
+                                ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                            ]
+                        stat = MEMORYSTATUSEX()
+                        stat.dwLength = ctypes.sizeof(stat)
+                        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                        avail = stat.ullAvailPhys
+                    except Exception:
+                        pass
+
+            if avail is not None:
+                # Reserve 128MB headroom for Python/paramiko/OS
+                headroom = 128 * 1024 * 1024
+                safe = avail - headroom
+                if buf_size > safe:
+                    old_mb = buf_size // (1024 * 1024)
+                    new_size = max(1 * 1024 * 1024, safe)  # floor at 1MB
+                    new_mb = new_size // (1024 * 1024)
+                    print(f"  {C.YELLOW}Warning: --buffer {old_mb}MB exceeds available RAM "
+                          f"({fmt_size(avail)} free){C.RESET}")
+                    print(f"  {C.YELLOW}Reducing buffer to {new_mb}MB to avoid MemoryError{C.RESET}")
+                    buf_size = new_size
+                    if buf_size < 1 * 1024 * 1024:
+                        print(f"  {C.RED}Error: Not enough free RAM for even a 1MB buffer "
+                              f"({fmt_size(avail)} available){C.RESET}")
+                        src_ssh.close()
+                        dst_ssh.close()
+                        sys.exit(1)
+
+            dst_ssh.exec_cmd(f"mkdir -p {shlex.quote(dst)}")
+
+            progress = Progress(unique_size, len(copy_entries))
+            t0 = time.time()
+            copy_hybrid_r2r(copy_entries, src_ssh, dst_ssh, src, dst, progress, buf_size)
+            progress.finish()
+
+            # Create links on dest
+            if link_map:
+                create_links_remote(dst_ssh, link_map, dst)
+
+            elapsed = time.time() - t0
+            speed = unique_size / elapsed if elapsed > 0 else 0
+
+            # Save manifest on dest
+            save_remote_manifest(dst_ssh, dst, copy_entries, link_map)
+
+            # Verify on dest
+            if not args.no_verify:
+                verify_copy_remote(dst_ssh, copy_entries, link_map, dst)
+
+            # Summary
+            banner("DONE")
+            print(f"  Source:  {C.BOLD}{src_remote.user}@{src_remote.host}:{src}{C.RESET}")
+            print(f"  Dest:    {C.BOLD}{dst_remote.user}@{dst_remote.host}:{dst}{C.RESET}")
+            print(f"  Files:   {C.BOLD}{total_files}{C.RESET} total"
+                  + (f" ({len(copy_entries)} copied + {len(link_map)} linked)" if link_map else ""))
+            if skipped_count:
+                print(f"  Skipped: {C.BOLD}{skipped_count}{C.RESET} unchanged files "
+                      f"({C.GREEN}{fmt_size(skipped_bytes)}{C.RESET})")
+            print(f"  Data:    {C.BOLD}{fmt_size(unique_size)}{C.RESET} relayed"
+                  + (f" ({fmt_size(saved_bytes)} saved by dedup)" if saved_bytes > 0 else ""))
+            print(f"  Time:    {C.BOLD}{fmt_time(elapsed)}{C.RESET}")
+            print(f"  Speed:   {C.GREEN}{C.BOLD}{fmt_speed(speed)}{C.RESET}")
+            print()
+
+        except KeyboardInterrupt:
+            print(f"\n  {C.YELLOW}Interrupted.{C.RESET}")
+            sys.exit(130)
+        except (OSError, IOError) as e:
+            print(f"\n{C.RED}Error: {e}{C.RESET}")
+            sys.exit(1)
+        except Exception as e:
+            ename = type(e).__name__
+            if "Authentication" in ename:
+                print(f"\n{C.RED}Error: SSH authentication failed{C.RESET}")
+            elif "SSH" in ename or "Socket" in ename or "paramiko" in type(e).__module__:
+                print(f"\n{C.RED}Error: SSH connection failed: {e}{C.RESET}")
+            elif "ConnectionReset" in ename or "BrokenPipe" in ename:
+                print(f"\n{C.RED}Error: Connection lost: {e}{C.RESET}")
+            else:
+                raise
+            sys.exit(1)
+        finally:
+            if src_ssh:
+                src_ssh.close()
+            if dst_ssh:
+                dst_ssh.close()
+
+        sys.exit(0)
+
+    # ══════════════════════════════════════════════════════════════════
+    # REMOTE → LOCAL FLOW
+    # ══════════════════════════════════════════════════════════════════
+    if src_remote and not dst_remote:
+        try:
+            # ── Phase 2b: Incremental check against local dest ───────
+            skipped_count = 0
+            skipped_bytes = 0
+
+            if not args.overwrite and os.path.isdir(dst):
+                banner("Phase 2b — Incremental check")
+                copy_entries, link_map, skipped_count, skipped_bytes = \
+                    filter_unchanged_remote_to_local(
+                        copy_entries, link_map, src_ssh, src, dst, args.threads
+                    )
+                unique_size = sum(e.size for e in copy_entries)
+
+                if not copy_entries and not link_map:
+                    banner("DONE — Nothing to copy")
+                    print(f"  All {skipped_count} files are already up to date.")
+                    print()
+                    src_ssh.close()
+                    sys.exit(0)
+
+            # ── Phase 3: Space check (local) ─────────────────────────
+            banner("Phase 3 — Space check")
+            required = unique_size
+            print(f"  Data to write: {C.BOLD}{fmt_size(required)}{C.RESET}"
+                  + (f" (after dedup saved {fmt_size(saved_bytes)})" if saved_bytes > 0 else ""))
+
+            if not check_destination_space(dst, required, args.force):
+                src_ssh.close()
+                sys.exit(1)
+
+            if args.dry_run:
+                small, large = split_by_size(copy_entries)
+                small_sz = sum(e.size for e in small)
+                large_sz = sum(e.size for e in large)
+                print(f"\n  {C.YELLOW}DRY RUN — Copy strategy:{C.RESET}\n")
+                print(f"    Small files (<1MB): {C.BOLD}{len(small)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(small_sz)}{C.RESET} → tar stream from remote")
+                print(f"    Large files (≥1MB): {C.BOLD}{len(large)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(large_sz)}{C.RESET} → SFTP download")
+                if link_map:
+                    print(f"\n  Plus {len(link_map)} duplicate files to be linked")
+                print(f"\n  Unique data: {fmt_size(unique_size)}")
+                src_ssh.close()
+                sys.exit(0)
+
+            # ── Phase 5: Download from remote ────────────────────────
+            banner("Phase 5 — Remote-to-local copy")
+            os.makedirs(dst, exist_ok=True)
+
+            progress = Progress(unique_size, len(copy_entries))
+            t0 = time.time()
+            copy_hybrid_remote_to_local(copy_entries, src_ssh, src, dst, progress, buf_size)
+            progress.finish()
+
+            # Create links locally
+            if link_map:
+                create_links(link_map, dst)
+
+            elapsed = time.time() - t0
+            speed = unique_size / elapsed if elapsed > 0 else 0
+
+            # Verify
+            if not args.no_verify:
+                verify_copy(copy_entries, link_map, dst)
+
+            # Summary
+            banner("DONE")
+            print(f"  Source:  {C.BOLD}{src_remote.user}@{src_remote.host}:{src}{C.RESET}")
+            print(f"  Dest:    {C.BOLD}{dst}{C.RESET}")
+            print(f"  Files:   {C.BOLD}{total_files}{C.RESET} total"
+                  + (f" ({len(copy_entries)} copied + {len(link_map)} linked)" if link_map else ""))
+            if skipped_count:
+                print(f"  Skipped: {C.BOLD}{skipped_count}{C.RESET} unchanged files "
+                      f"({C.GREEN}{fmt_size(skipped_bytes)}{C.RESET})")
+            print(f"  Data:    {C.BOLD}{fmt_size(unique_size)}{C.RESET} downloaded"
+                  + (f" ({fmt_size(saved_bytes)} saved by dedup)" if saved_bytes > 0 else ""))
+            print(f"  Time:    {C.BOLD}{fmt_time(elapsed)}{C.RESET}")
+            print(f"  Speed:   {C.GREEN}{C.BOLD}{fmt_speed(speed)}{C.RESET}")
+            print()
+
+        except KeyboardInterrupt:
+            print(f"\n  {C.YELLOW}Interrupted.{C.RESET}")
+            sys.exit(130)
+        except (OSError, IOError) as e:
+            print(f"\n{C.RED}Error: {e}{C.RESET}")
+            sys.exit(1)
+        except Exception as e:
+            ename = type(e).__name__
+            if "Authentication" in ename:
+                print(f"\n{C.RED}Error: SSH authentication failed{C.RESET}")
+            elif "SSH" in ename or "Socket" in ename or "paramiko" in type(e).__module__:
+                print(f"\n{C.RED}Error: SSH connection failed: {e}{C.RESET}")
+            elif "ConnectionReset" in ename or "BrokenPipe" in ename:
+                print(f"\n{C.RED}Error: Connection lost: {e}{C.RESET}")
+            else:
+                raise
+            sys.exit(1)
+        finally:
+            if src_ssh:
+                src_ssh.close()
+
+        sys.exit(0)
+
+    # ══════════════════════════════════════════════════════════════════
+    # LOCAL → REMOTE SSH FLOW
+    # ══════════════════════════════════════════════════════════════════
+    if remote:
+        ssh = None
+        try:
+            # ── Connect ──────────────────────────────────────────────
+            banner("SSH — Connecting")
+            password = None
+            if args.ssh_password:
+                password = getpass.getpass(f"Password for {remote.user}@{remote.host}: ")
+            ssh = SSHConnection(remote, port=remote.port, key_path=args.ssh_key,
+                                password=password, compress=args.compress,
+                                ).connect()
+            print(f"  {C.GREEN}Connected to {remote.user}@{remote.host}:{remote.port}{C.RESET}")
+            caps = [k for k, v in ssh.caps.items() if v]
+            print(f"  {C.DIM}Remote tools: {', '.join(caps) or 'none detected'}{C.RESET}")
+
+            # ── Phase 2b: Remote incremental check ───────────────────
+            skipped_count = 0
+            skipped_bytes = 0
+
+            if not args.overwrite:
+                banner("Phase 2b — Remote incremental check")
+                copy_entries, link_map, skipped_count, skipped_bytes = \
+                    filter_unchanged_remote(copy_entries, link_map, ssh, dst)
+                unique_size = sum(e.size for e in copy_entries)
+
+                if not copy_entries and not link_map:
+                    banner("DONE — Nothing to copy")
+                    print(f"  All {skipped_count} files are already up to date on remote.")
+                    print()
+                    ssh.close()
+                    sys.exit(0)
+
+            # ── Phase 3: Remote space check ──────────────────────────
+            banner("Phase 3 — Space check (remote)")
+            required = unique_size
+            print(f"  Data to write: {C.BOLD}{fmt_size(required)}{C.RESET}"
+                  + (f" (after dedup saved {fmt_size(saved_bytes)})" if saved_bytes > 0 else ""))
+
+            if not check_remote_space(ssh, dst, required, args.force):
+                ssh.close()
+                sys.exit(1)
+
+            # ── Phase 4: Resolve physical layout (local source) ──────
+            banner("Phase 4 — Mapping physical disk layout")
+            copy_entries = resolve_physical_offsets(copy_entries, args.threads)
+
+            if args.dry_run:
+                small, large = split_by_size(copy_entries)
+                small_sz = sum(e.size for e in small)
+                large_sz = sum(e.size for e in large)
+                print(f"\n  {C.YELLOW}DRY RUN — Copy strategy:{C.RESET}\n")
+                print(f"    Small files (<1MB): {C.BOLD}{len(small)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(small_sz)}{C.RESET} → tar stream over SSH")
+                print(f"    Large files (≥1MB): {C.BOLD}{len(large)}{C.RESET} files, "
+                      f"{C.BOLD}{fmt_size(large_sz)}{C.RESET} → SFTP pipelined")
+                if link_map:
+                    print(f"\n  Plus {len(link_map)} duplicate files to be linked on remote")
+                print(f"\n  Unique data: {fmt_size(unique_size)}")
+                ssh.close()
+                sys.exit(0)
+
+            # ── Phase 5: Remote copy ─────────────────────────────────
+            banner("Phase 5 — Remote copy")
+            ssh.exec_cmd(f"mkdir -p {shlex.quote(dst)}")
+
+            progress = Progress(unique_size, len(copy_entries))
+            t0 = time.time()
+            copy_hybrid_remote(copy_entries, ssh, dst, progress, buf_size)
+            progress.finish()
+
+            # Create links on remote
+            if link_map:
+                create_links_remote(ssh, link_map, dst)
+
+            elapsed = time.time() - t0
+            speed = unique_size / elapsed if elapsed > 0 else 0
+
+            # ── Save manifest on remote ──────────────────────────────
+            save_remote_manifest(ssh, dst, copy_entries, link_map)
+
+            # ── Verify on remote ─────────────────────────────────────
+            if not args.no_verify:
+                verify_copy_remote(ssh, copy_entries, link_map, dst)
+
+            # ── Summary ──────────────────────────────────────────────
+            banner("DONE")
+            print(f"  Remote:  {C.BOLD}{remote.user}@{remote.host}:{dst}{C.RESET}")
+            print(f"  Files:   {C.BOLD}{total_files}{C.RESET} total"
+                  + (f" ({len(copy_entries)} copied + {len(link_map)} linked)" if link_map else ""))
+            if skipped_count:
+                print(f"  Skipped: {C.BOLD}{skipped_count}{C.RESET} unchanged files "
+                      f"({C.GREEN}{fmt_size(skipped_bytes)}{C.RESET})")
+            print(f"  Data:    {C.BOLD}{fmt_size(unique_size)}{C.RESET} sent"
+                  + (f" ({fmt_size(saved_bytes)} saved by dedup)" if saved_bytes > 0 else ""))
+            print(f"  Time:    {C.BOLD}{fmt_time(elapsed)}{C.RESET}")
+            print(f"  Speed:   {C.GREEN}{C.BOLD}{fmt_speed(speed)}{C.RESET}")
+            print()
+
+        except KeyboardInterrupt:
+            print(f"\n  {C.YELLOW}Interrupted.{C.RESET}")
+            sys.exit(130)
+        except (OSError, IOError) as e:
+            print(f"\n{C.RED}Error: {e}{C.RESET}")
+            sys.exit(1)
+        except Exception as e:
+            ename = type(e).__name__
+            if "Authentication" in ename:
+                print(f"\n{C.RED}Error: SSH authentication failed for "
+                      f"{remote.user}@{remote.host}{C.RESET}")
+            elif "SSH" in ename or "Socket" in ename or "paramiko" in type(e).__module__:
+                print(f"\n{C.RED}Error: SSH connection failed: {e}{C.RESET}")
+            elif "ConnectionReset" in ename or "BrokenPipe" in ename:
+                print(f"\n{C.RED}Error: Connection lost: {e}{C.RESET}")
+            else:
+                raise
+            sys.exit(1)
+        finally:
+            if ssh:
+                ssh.close()
+
+        sys.exit(0)
+
+    # ══════════════════════════════════════════════════════════════════
+    # LOCAL FLOW
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
+                        total_files, unique_size, saved_bytes, buf_size)
+    finally:
+        if dedup_db:
+            dedup_db.close()
+
+
+def _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
+                    total_files, unique_size, saved_bytes, buf_size):
     # ── Phase 2b: Skip unchanged files ────────────────────────────────
     skipped_count = 0
     skipped_bytes = 0
@@ -1430,16 +3505,14 @@ def main():
         unique_size = sum(e.size for e in copy_entries)
 
         if not copy_entries and not link_map:
-            if dedup_db:
-                dedup_db.close()
             banner("DONE — Nothing to copy")
             print(f"  All {skipped_count} files are already up to date.")
             print()
-            sys.exit(0)
+            return
 
     # ── Phase 3: Space check ──────────────────────────────────────────
     banner("Phase 3 — Space check")
-    required = unique_size  # after dedup, only unique data needs disk space
+    required = unique_size
     print(f"  Data to write: {C.BOLD}{fmt_size(required)}{C.RESET}"
           + (f" (after dedup saved {fmt_size(saved_bytes)})" if saved_bytes > 0 else ""))
 
@@ -1469,9 +3542,7 @@ def main():
         if link_map:
             print(f"\n  Plus {len(link_map)} duplicate files to be linked")
         print(f"\n  Unique data: {fmt_size(unique_size)}")
-        if dedup_db:
-            dedup_db.close()
-        sys.exit(0)
+        return
 
     # ── Phase 5: Block copy ─────────────────────────────────────────
     banner("Phase 5 — Block copy")
@@ -1494,11 +3565,10 @@ def main():
         dst_rows = []
         for e in copy_entries:
             if not e.content_hash:
-                continue  # skip unhashed files — will be cached on next run
+                continue
             dst_rows.append((e.rel, e.size, e.content_hash))
         if dst_rows:
             dedup_db.store_dest_batch(dst_rows)
-        dedup_db.close()
 
     # ── Verify ────────────────────────────────────────────────────────
     if not args.no_verify:
@@ -1519,4 +3589,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n  {C.YELLOW}Interrupted.{C.RESET}")
+        sys.exit(130)

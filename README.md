@@ -1,81 +1,118 @@
-# fast-copy — High-Speed File Copier with Deduplication and Block-Order I/O
+# fast-copy — High-Speed File Copier with Deduplication & SSH Streaming
 
-A fast, cross-platform command-line tool to copy files and folders at maximum sequential disk speed. Reads files in physical disk order, deduplicates identical files via content hashing (xxh128/SHA-256), bundles thousands of small files into a single block stream, and hard-links duplicates — drastically faster than `cp`, `robocopy`, or drag-and-drop for USB drives, external HDDs, NAS backups, and large file transfers. Supports directories, single files, and glob/wildcard patterns.
+A fast, cross-platform command-line tool for copying files and directories at maximum sequential disk speed. Designed for USB drives, external HDDs, NAS backups, and large SSH transfers.
 
-Works on **Linux**, **macOS**, and **Windows**. No dependencies beyond Python 3.8+ (or use the standalone binary). Optional xxHash support for ~10x faster hashing.
+**Key capabilities:**
+- Reads files in **physical disk order** (eliminates random seeks on HDDs)
+- **Content-aware deduplication** — copies each unique file once, hard-links duplicates
+- **Cross-run dedup database** — SQLite cache remembers hashes across runs
+- **SSH remote transfers** — local↔remote and remote↔remote with tar pipe streaming
+- **Chunked streaming** — 100 MB tar batches with streaming extraction (no temp files)
+- **Pre-flight space check** and **post-copy verification**
+- Works on **Linux**, **macOS**, and **Windows** (including long paths >260 chars)
 
 ## Why fast-copy?
 
-| Problem | How fast-copy solves it |
-|---------|----------------------|
+| Problem | Solution |
+|---------|----------|
 | `cp -r` is slow on HDDs due to random seeks | Reads files in **physical disk order** for sequential throughput |
-| Copying thousands of small files is painfully slow | **Bundles small files** into a single block stream write |
-| Duplicate files waste space and time | **Content-aware dedup** — copies each unique file once, hard-links the rest |
-| No idea if the USB has enough space until it fails mid-copy | **Pre-flight space check** before any data is written |
-| Silent corruption on cheap USB drives | **Post-copy verification** hashes every file to confirm integrity |
+| Thousands of small files copy painfully slow | **Bundles small files** into tar stream batches |
+| Duplicate files waste space and time | **Content-aware dedup** — copies once, hard-links the rest |
+| No space check until copy fails mid-way | **Pre-flight space check** before any data is written |
+| Silent corruption on cheap USB drives | **Post-copy verification** confirms integrity |
 | Need it on multiple OSes | **Cross-platform** — Linux, macOS, Windows with native I/O optimizations |
+| Copying between two servers is painful | **Remote-to-remote relay** via SSH tar pipe streaming |
+| SFTP is slow (~1-2 MB/s) | **Raw SSH tar streaming** bypasses SFTP overhead (5-10 MB/s on LAN) |
 
-## How it works
+## How It Works
 
-**fast-copy** copies folders in 5 phases:
+### Local-to-Local Copy
 
-1. **Scan** — Walks the source tree and indexes every file with its size.
-2. **Dedup** — Groups files by size, then hashes (xxHash or MD5) to find identical content. Each unique file is copied once; duplicates become hard links at the destination.
-3. **Space check** — Compares the deduplicated data size against free space on the destination disk before writing anything.
-4. **Physical layout mapping** — Resolves the on-disk physical offset of each file (via `FIEMAP`/`ioctl` on Linux, `fcntl` on macOS, `FSCTL` on Windows) and sorts files by physical block order to eliminate random seeks.
-5. **Block copy** — Large files (>=1 MB) are copied individually with 64 MB buffers. Small files are bundled into a single tar-like block stream, written sequentially, then extracted — turning thousands of random writes into one continuous write. Duplicates are recreated as hard links.
+Files are copied in 5 phases:
 
-After copying, all files are verified against their source hashes.
+1. **Scan** — Walks the source tree, indexes every file with its size
+2. **Dedup** — Hashes files (xxHash-128 or SHA-256) to find identical content. Each unique file is copied once; duplicates become hard links
+3. **Space check** — Verifies the destination has enough free space for the deduplicated data
+4. **Physical layout** — Resolves on-disk physical offsets (`FIEMAP` on Linux, `fcntl` on macOS, `FSCTL` on Windows) and sorts files by block order
+5. **Block copy** — Large files (≥1 MB) are copied with 64 MB buffers. Small files are bundled into a tar block stream for sequential I/O. Duplicates are recreated as hard links
+
+After copying, all files are verified against source hashes.
+
+### SSH Remote Transfers
+
+All four copy modes are supported:
+
+| Mode | How it works |
+|------|-------------|
+| **Local → Remote** | Files are streamed as chunked tar batches over SSH. Remote runs `tar xf -` to extract on the fly |
+| **Remote → Local** | Remote runs `tar cf -`, local extracts with streaming extraction — files appear on disk as data arrives (no temp file) |
+| **Remote → Remote** | Data relays through your machine: source `tar cf` → SSH → local relay buffer → SSH → dest `tar xf` |
+| **Local → Local** | Direct disk I/O with physical block ordering and tar bundling |
+
+**Chunked tar streaming:** Files are split into ~100 MB batches. Each batch is a separate tar stream over SSH. This provides:
+- Progress updates per batch
+- Error recovery (partial batches don't lose completed work)
+- No temp files — streaming extraction writes files directly to disk
+- Large files (≥1 MB) get per-chunk progress updates during extraction
+
+**Deduplication on remote sources:** File hashing runs on the remote server via `python3` or `sha256sum` over SSH, in batches of 5,000 files to avoid timeouts.
+
+**SFTP-free operation:** When the remote server has `tar` available, all transfers use raw SSH channels instead of SFTP. This avoids SFTP protocol overhead and works even on servers with SFTP disabled (e.g., Synology NAS). Manifests are read/written via exec commands with SFTP as fallback.
+
+### How the Buffer Works
+
+The buffer is a fixed-size transfer window. Even a 500 GB file only holds 64 MB in RAM at a time:
+
+```
+Source (500GB file)          Buffer (64MB)         Destination file
+┌──────────────────┐        ┌─────────┐           ┌──────────────────┐
+│ chunk 1 (64MB)   │──read──│ 64MB    │──write──▶ │ chunk 1 (64MB)   │
+│ chunk 2 (64MB)   │──read──│ 64MB    │──write──▶ │ chunk 2 (64MB)   │
+│ ...              │        │ (reused)│           │ ...              │
+│ chunk 7813       │──read──│ 64MB    │──write──▶ │ chunk 7813       │
+└──────────────────┘        └─────────┘           └──────────────────┘
+                                                   = 500GB complete
+```
+
+Adjust with `--buffer`: `--buffer 8` for low-memory systems, `--buffer 128` for fast SSDs.
+
+### How Remote-to-Remote Works
+
+When both source and destination are remote SSH servers, data relays through your local machine:
+
+```
+┌─────────────┐        ┌───────────────┐        ┌─────────────┐
+│  Source SSH  │  tar   │ Your machine  │  tar   │  Dest SSH   │
+│   server    │ ─────▶ │   (relay)     │ ─────▶ │   server    │
+└─────────────┘ cf -   └───────────────┘ xf -   └─────────────┘
+```
+
+The two servers do not need to reach each other directly. Data streams through in ~100 MB tar batches — your machine never stores the full dataset.
 
 ## Installation
 
 ```bash
-# Run directly with Python (3.8+)
+# Run directly with Python 3.8+
 python fast_copy.py <source> <destination>
 
-# Or build a standalone executable
-pip install pyinstaller
-python build.py
-./dist/fast_copy <source> <destination>
+# SSH support requires paramiko
+pip install paramiko
+
+# Optional: ~10x faster hashing
+pip install xxhash
 ```
 
-### Optional: Install xxHash for ~10x faster hashing
+### Platform-specific xxHash installation
 
-fast-copy works out of the box with Python's built-in SHA-256, but installing xxHash makes the hashing phase dramatically faster. This matters most when copying large datasets or running deduplication.
+| Platform | Command |
+|----------|---------|
+| Debian/Ubuntu | `sudo apt install python3-xxhash` |
+| Fedora/RHEL | `sudo dnf install python3-xxhash` |
+| Arch | `sudo pacman -S python-xxhash` |
+| macOS | `brew install python-xxhash` |
+| Windows | `pip install xxhash` |
 
-**Linux (Debian/Ubuntu)**
-```bash
-sudo apt install python3-xxhash
-```
-
-**Linux (Fedora/RHEL)**
-```bash
-sudo dnf install python3-xxhash
-```
-
-**Linux (Arch)**
-```bash
-sudo pacman -S python-xxhash
-```
-
-**macOS (Homebrew)**
-```bash
-brew install python-xxhash
-```
-
-**Windows**
-
-Download the matching `.whl` from [pypi.org/project/xxhash/#files](https://pypi.org/project/xxhash/#files) for your Python version and architecture, then install it:
-```powershell
-python -m pip install xxhash-X.X.X-cpXXX-cpXXX-win_amd64.whl
-```
-
-To verify it's installed:
-```bash
-python -c "import xxhash; print(xxhash.xxh128(b'test').hexdigest())"
-```
-
-If xxHash is not installed, fast-copy silently falls back to SHA-256 — no errors, just slower hashing.
+If xxHash is not installed, fast-copy silently falls back to SHA-256.
 
 ## Usage
 
@@ -83,179 +120,158 @@ If xxHash is not installed, fast-copy silently falls back to SHA-256 — no erro
 usage: fast_copy.py [-h] [--buffer BUFFER] [--threads THREADS] [--dry-run]
                     [--no-verify] [--no-dedup] [--no-cache] [--force]
                     [--overwrite] [--exclude EXCLUDE]
+                    [--ssh-src-port PORT] [--ssh-src-key PATH] [--ssh-src-password]
+                    [--ssh-dst-port PORT] [--ssh-dst-key PATH] [--ssh-dst-password]
+                    [-z]
                     source destination
 
 positional arguments:
-  source             Source folder, file, or glob pattern (e.g. *.zip)
-  destination        Destination (USB drive path, etc)
+  source               Source folder, file, glob, or remote (user@host:/path)
+  destination          Destination path or remote (user@host:/path)
 
 options:
-  -h, --help         show this help message and exit
-  --buffer BUFFER    Buffer size in MB (default: 64)
-  --threads THREADS  Threads for hashing/layout (default: 4)
-  --dry-run          Show copy plan without copying
-  --no-verify        Skip post-copy verification
-  --no-dedup         Disable deduplication
-  --no-cache         Disable persistent hash cache (cross-run dedup database)
-  --force            Skip space check, copy even if not enough space
-  --overwrite        Overwrite all files, skip identical-file detection
-  --exclude EXCLUDE  Exclude files/dirs by name (can use multiple times)
+  -h, --help              Show help message and exit
+  --buffer BUFFER         Buffer size in MB (default: 64)
+  --threads THREADS       Threads for hashing/layout (default: 4)
+  --dry-run               Show copy plan without copying
+  --no-verify             Skip post-copy verification
+  --no-dedup              Disable deduplication
+  --no-cache              Disable persistent hash cache (cross-run dedup database)
+  --force                 Skip space check, copy even if not enough space
+  --overwrite             Overwrite all files, skip identical-file detection
+  --exclude EXCLUDE       Exclude files/dirs by name (can use multiple times)
+
+SSH source options:
+  --ssh-src-port PORT     SSH port for remote source (default: 22)
+  --ssh-src-key PATH      Path to SSH private key for remote source
+  --ssh-src-password      Prompt for SSH password for remote source
+
+SSH destination options:
+  --ssh-dst-port PORT     SSH port for remote destination (default: 22)
+  --ssh-dst-key PATH      Path to SSH private key for remote destination
+  --ssh-dst-password      Prompt for SSH password for remote destination
+
+General SSH options:
+  -z, --compress          Enable SSH compression (good for slow links)
 ```
 
 ## Examples
 
-### Copy a folder to a USB drive
+### Local copy
 
 ```bash
-# Linux / macOS
+# Copy a folder to USB drive
 python fast_copy.py /home/kai/my-app /mnt/usb/my-app
+
+# Copy a single file
+python fast_copy.py ~/Downloads/Rocky-10.0-x86_64-dvd1.iso /mnt/usb/
+
+# Glob pattern
+python fast_copy.py "~/Downloads/*.zip" /mnt/usb/zips/
 
 # Windows
 python fast_copy.py "C:\Projects\my-app" "E:\Backup\my-app"
 ```
 
-### Copy a single file
+### SSH remote transfers
 
 ```bash
-# Linux / macOS
-python fast_copy.py ~/Downloads/Rocky-10.0-x86_64-dvd1.iso /mnt/usb/
+# Local to remote
+python fast_copy.py /data user@server:/backup/data --ssh-dst-password
 
-# Windows
-python fast_copy.py "C:\Users\kai\Downloads\Rocky-10.0-x86_64-dvd1.iso" "D:\"
+# Remote to local
+python fast_copy.py user@server:/data /local/backup --ssh-src-password
+
+# Remote to remote (relay through your machine)
+python fast_copy.py user@src-host:/data admin@dst-host:/backup/data \
+    --ssh-src-password --ssh-dst-password
+
+# Custom ports and keys
+python fast_copy.py user@host:/data /local \
+    --ssh-src-port 2222 --ssh-src-key ~/.ssh/id_ed25519
+
+# Destination on non-standard port (e.g., Synology NAS)
+python fast_copy.py /local/data "user@nas:/volume1/Shared Folder/backup" \
+    --ssh-dst-port 2205 --ssh-dst-password
 ```
 
-### Copy files matching a wildcard pattern
+### Other options
 
 ```bash
-# All zip files
-python fast_copy.py "~/Downloads/*.zip" /mnt/usb/zips/
-
-# All ISO images (Windows)
-python fast_copy.py "C:\ISOs\*.iso" "E:\Backup\ISOs"
-
-# All log files
-python fast_copy.py "/var/log/*.log" /mnt/usb/logs/
-```
-
-### Dry run (preview without copying)
-
-```bash
+# Dry run (preview without copying)
 python fast_copy.py /data /mnt/usb/data --dry-run
-```
 
-### Skip deduplication
-
-```bash
+# Skip deduplication (faster for unique files)
 python fast_copy.py /data /mnt/usb/data --no-dedup
+
+# Exclude directories
+python fast_copy.py /project /mnt/usb/project --exclude node_modules --exclude .git
 ```
 
-### Exclude directories
+## Real-World Benchmarks
 
-```bash
-python fast_copy.py /home/user/project /mnt/usb/project --exclude node_modules --exclude .git
-```
-
-## Example output
+### Local-to-Local: 59,925 files (593 MB) to HDD
 
 ```
-$ time python fast_copy.py /home/kai/my-app /mnt/folders/my-app/
-
-────────────────────────────────────────────────────────────
-  FAST BLOCK-ORDER COPY
-────────────────────────────────────────────────────────────
-
-  Source:      /home/kai/my-app
-  Destination: /mnt/folders/my-app
-  Buffer:      64 MB
-  Dedup:       enabled
-  Platform:    Linux
-
-
-────────────────────────────────────────────────────────────
-  Phase 1 — Scanning source
-────────────────────────────────────────────────────────────
-
-  Found 59925 files
-  Total: 593.2 MB in 59925 files  (avg 10.1 KB/file)
-
-────────────────────────────────────────────────────────────
-  Phase 2 — Deduplication
-────────────────────────────────────────────────────────────
-
-  Using hash: md5
-  55327 files in same-size groups need hashing...
-  Dedup complete:
-    Unique files:    44454
-    Duplicates:      15471 (25.8% of files)
-    Space saved:     92.5 MB (15.6% reduction)
-
-────────────────────────────────────────────────────────────
-  Phase 3 — Space check
-────────────────────────────────────────────────────────────
-
-  Data to write: 500.7 MB (after dedup saved 92.5 MB)
-  Destination disk:
-    Total:     931.1 GB
-    Free:      913.2 GB (98.1% free)
-    Required:  500.7 MB
-    Headroom:  912.7 GB
-
-  ✓ Enough space
-
-────────────────────────────────────────────────────────────
-  Phase 4 — Mapping physical disk layout
-────────────────────────────────────────────────────────────
-
-  Disk layout resolved: 44453/44454 files mapped
-
-────────────────────────────────────────────────────────────
-  Phase 5 — Block copy
-────────────────────────────────────────────────────────────
-
-  Strategy:
-    Small files (<1MB): 44410 files, 230.4 MB → block stream
-    Large files (≥1MB): 44 files, 270.2 MB → individual copy
-
-  ── Large files ──
-  ███████████████░░░░░░░░░░░░░░░  51.3%  256.8 MB/500.7 MB  793.5 MB/s
-
-  ── Small files (block stream) ──
-  Bundling 44410 small files (230.4 MB) into single block stream...
-  █████████████████████████████░ 100.0%  500.4 MB/500.7 MB  109.5 MB/s
-  Block written: 306.6 MB bundle on USB
-  Extracted 44410 files from block
-  ██████████████████████████████ 100%  500.7 MB in 11.8s  avg 42.5 MB/s
-  Links created: 15471 hard links
-
-  ✓ Verified: all 59925 files OK
-
-────────────────────────────────────────────────────────────
-  DONE
-────────────────────────────────────────────────────────────
-
   Files:   59925 total (44454 unique + 15471 linked)
   Data:    500.7 MB written (92.5 MB saved by dedup)
   Time:    12.1s
   Speed:   41.2 MB/s
-
-
-real    0m17.661s
-user    0m10.713s
-sys     0m9.092s
 ```
 
-## Key features
+Dedup detected 15,471 duplicate files (25.8%), saving 92.5 MB. Files were read in physical disk order and small files bundled into block streams.
 
-- **Block-order reads** — Files are read in physical disk order, eliminating random seeks on HDDs and improving throughput on SSDs.
-- **Content deduplication** — Identical files are detected by hash (xxh128 when available, SHA-256 fallback). Each unique file is written once; duplicates become hard links, saving space and write time.
-- **Cross-run dedup database** — SQLite cache at the drive root remembers file hashes across runs. Copy the same source to a new folder? Zero bytes written — all files hard-linked to existing copies.
-- **Flexible source** — Copy a directory, a single file, or a glob pattern (`*.zip`, `*.iso`).
-- **Small-file block streaming** — Thousands of small files are bundled into a single sequential write, then extracted — avoids the overhead of creating files one by one.
-- **Pre-flight space check** — Verifies the destination has enough free space before writing, accounting for dedup savings.
-- **Post-copy verification** — Every copied file is verified against the source to guarantee integrity.
-- **64 MB I/O buffers** — Large buffers keep the disk busy and reduce syscall overhead.
-- **Cross-platform** — Works on Linux, macOS, and Windows with platform-specific optimizations for physical layout detection.
-- **Standalone binary** — Build with PyInstaller for a single-file executable with no Python dependency.
+### Remote-to-Local: 91,669 files (888 MB) over 100 Mbps LAN
+
+```
+  Files:   91669 total (44718 copied + 46951 linked)
+  Data:    509.8 MB downloaded (378.5 MB saved by dedup)
+  Time:    14m 2s
+  Speed:   619.5 KB/s
+```
+
+Dedup found 46,951 duplicates (51.2%), saving 378.5 MB of transfer. Files streamed in 6 tar batches of ~100 MB each with streaming extraction (no temp files). All 91,669 files verified after copy.
+
+### Local-to-Remote: 91,663 files (888 MB) over 100 Mbps LAN
+
+```
+  Files:   91663 total (44712 copied + 46951 linked)
+  Data:    509.8 MB uploaded
+  Time:    2m 7s
+  Speed:   4.0 MB/s
+```
+
+Uploaded in 6 tar batches. Remote hard links created via batched Python script over SSH (5,000 links per batch). 3x faster than SFTP-based transfer.
+
+### Remote-to-Remote: 3 files (1.7 GB) relay through local machine
+
+```
+  Files:   3 total
+  Data:    1.7 GB relayed
+  Time:    5m 30s
+  Speed:   5.2 MB/s
+```
+
+Data relayed between two SSH servers via tar pipe. Source and destination did not need direct connectivity. Verified on destination after transfer.
+
+## Key Features
+
+- **Block-order reads** — Files read in physical disk order, eliminating random seeks
+- **Content deduplication** — xxHash-128 or SHA-256 hashing; copies once, hard-links duplicates
+- **Cross-run dedup database** — SQLite cache at drive root; re-runs skip already-copied content
+- **Chunked tar streaming** — 100 MB batches with streaming extraction; no temp files
+- **SFTP-free SSH transfers** — Uses raw SSH channels with tar; works on servers with SFTP disabled
+- **Flexible source** — Directories, single files, or glob patterns (`*.zip`, `*.iso`)
+- **Pre-flight space check** — Verifies space before writing; walks parent directories for remote paths
+- **Post-copy verification** — Every file verified against source hash
+- **Windows long path support** — Handles paths exceeding 260 characters via `\\?\` prefix
+- **Authentication retry** — Prompts for password up to 3 times on auth failure; handles Ctrl+C gracefully
+- **Cross-platform** — Linux, macOS, and Windows with native I/O optimizations
+- **Standalone binary** — Build with PyInstaller for a single-file executable
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
 
 ## Support
 

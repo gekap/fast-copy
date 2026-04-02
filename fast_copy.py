@@ -462,10 +462,6 @@ class SSHConnection:
         self.caps = {}
 
     def connect(self):
-        if not _has_paramiko:
-            print(f"{C.RED}Error: paramiko not installed. Run: python -m pip install paramiko{C.RESET}")
-            sys.exit(1)
-
         self.client = paramiko.SSHClient()
         # Load system known_hosts for host key verification
         try:
@@ -2873,6 +2869,17 @@ def main():
     # ── Detect remote source and destination ──────────────────────────
     src_remote = parse_remote_path(src_arg)
     dst_remote = parse_remote_path(args.destination)
+
+    # Check paramiko is installed if SSH is needed
+    if (src_remote or dst_remote) and not _has_paramiko:
+        print(f"\n  {C.RED}Error: SSH transfers require paramiko.{C.RESET}")
+        print(f"  Install it with: {C.BOLD}python -m pip install paramiko{C.RESET}\n")
+        sys.exit(1)
+
+    # One-time warning if xxhash is not installed
+    if _hash_name != "xxh128":
+        print(f"  {C.YELLOW}Note: xxhash not installed — using SHA-256 (slower).{C.RESET}")
+        print(f"  {C.DIM}Install for ~10x faster hashing: python -m pip install xxhash{C.RESET}")
 
     if src_remote:
         src_remote = src_remote._replace(port=args.src_port)

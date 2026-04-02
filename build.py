@@ -22,11 +22,12 @@ def install_deps():
     deps = {
         "pyinstaller": "PyInstaller",
         "xxhash": "xxhash",
+        "paramiko": "paramiko",
     }
     for pip_name, import_name in deps.items():
         try:
             __import__(import_name)
-            print(f"  ✓ {pip_name}")
+            print(f"  OK: {pip_name}")
         except ImportError:
             print(f"  Installing {pip_name}...")
             try:
@@ -54,6 +55,7 @@ def build_target(name, script):
         "--noupx",
         "--console",
         "--hidden-import=xxhash",
+        "--hidden-import=paramiko",
         script,
     ]
 
@@ -63,10 +65,10 @@ def build_target(name, script):
     if result.returncode == 0:
         binary = os.path.join("dist", out)
         size_mb = os.path.getsize(binary) / (1024 * 1024)
-        print(f"  ✓ {binary} ({size_mb:.1f} MB)")
+        print(f"  OK: {binary} ({size_mb:.1f} MB)")
         return True
     else:
-        print(f"  ✗ Failed to build {name}")
+        print(f"  FAILED: {name}")
         if result.stderr:
             for line in result.stderr.strip().split('\n')[-5:]:
                 print(f"    {line}")
@@ -76,8 +78,8 @@ def build_target(name, script):
 def main():
     clean = "--clean" in sys.argv
 
-    print(f"Fast Copy Builder — {platform.system()} ({platform.machine()})")
-    print(f"{'─' * 50}")
+    print(f"Fast Copy Builder - {platform.system()} ({platform.machine()})")
+    print("-" * 50)
 
     if not os.path.exists("fast_copy.py"):
         print("  Error: fast_copy.py not found in current directory")
@@ -103,7 +105,7 @@ def main():
 
     # Summary
     ext = ".exe" if platform.system() == "Windows" else ""
-    print(f"\n{'─' * 50}")
+    print(f"\n{'-' * 50}")
     if success:
         print(f"Build complete:\n")
         print(f'  dist/fast_copy{ext}')

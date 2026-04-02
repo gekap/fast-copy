@@ -40,14 +40,13 @@ After copying, all files are verified against source hashes.
 
 ### SSH Remote Transfers
 
-All four copy modes are supported:
+Three remote copy modes are supported:
 
 | Mode | How it works |
 |------|-------------|
 | **Local → Remote** | Files are streamed as chunked tar batches over SSH. Remote runs `tar xf -` to extract on the fly |
 | **Remote → Local** | Remote runs `tar cf -`, local extracts with streaming extraction — files appear on disk as data arrives (no temp file) |
 | **Remote → Remote** | Data relays through your machine: source `tar cf` → SSH → local relay buffer → SSH → dest `tar xf` |
-| **Local → Local** | Direct disk I/O with physical block ordering and tar bundling |
 
 **Chunked tar streaming:** Files are split into ~100 MB batches. Each batch is a separate tar stream over SSH. This provides:
 - Progress updates per batch

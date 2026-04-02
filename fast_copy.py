@@ -63,7 +63,7 @@ Options:
   --ssh-src-password    Prompt for SSH password for source
   -z, --compress    Enable SSH compression (good for slow links)
 
-Requires: pip install paramiko
+Requires: python -m pip install paramiko
 """
 
 import os
@@ -463,7 +463,7 @@ class SSHConnection:
 
     def connect(self):
         if not _has_paramiko:
-            print(f"{C.RED}Error: paramiko not installed. Run: pip install paramiko{C.RESET}")
+            print(f"{C.RED}Error: paramiko not installed. Run: python -m pip install paramiko{C.RESET}")
             sys.exit(1)
 
         self.client = paramiko.SSHClient()

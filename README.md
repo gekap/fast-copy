@@ -95,10 +95,10 @@ The two servers do not need to reach each other directly. Data streams through i
 python fast_copy.py <source> <destination>
 
 # SSH support requires paramiko
-pip install paramiko
+python -m pip install paramiko
 
 # Optional: ~10x faster hashing
-pip install xxhash
+python -m pip install xxhash
 ```
 
 ### Platform-specific xxHash installation
@@ -109,7 +109,7 @@ pip install xxhash
 | Fedora/RHEL | `sudo dnf install python3-xxhash` |
 | Arch | `sudo pacman -S python-xxhash` |
 | macOS | `brew install python-xxhash` |
-| Windows | `pip install xxhash` |
+| Windows | `python -m pip install xxhash` |
 
 If xxHash is not installed, fast-copy silently falls back to SHA-256.
 

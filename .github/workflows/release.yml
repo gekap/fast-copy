@@ -1,0 +1,77 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            artifact: fast_copy
+          - os: macos-latest
+            name: macos
+            artifact: fast_copy
+          - os: windows-latest
+            name: windows
+            artifact: fast_copy.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build executable
+        run: python build.py
+
+      - name: Rename binary with platform suffix
+        shell: bash
+        run: |
+          if [ "${{ matrix.name }}" = "windows" ]; then
+            mv dist/fast_copy.exe dist/fast_copy-${{ matrix.name }}.exe
+          else
+            mv dist/fast_copy dist/fast_copy-${{ matrix.name }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast_copy-${{ matrix.name }}
+          path: dist/fast_copy-${{ matrix.name }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Upload each binary
+          for f in artifacts/fast_copy-*/*; do
+            echo "Uploading $f ..."
+            gh release upload "$tag" "$f" --clobber
+          done
+          # Also upload the Python script
+          gh release upload "$tag" fast_copy.py --clobber

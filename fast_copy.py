@@ -2015,7 +2015,9 @@ def create_links_remote(ssh, link_map, remote_root):
 
 
 def verify_copy_remote(ssh, entries, link_map, remote_root):
-    """Verify files on remote: check existence + size via find."""
+    """Verify files on remote: check existence + size, and hash-verify a sample.
+    Note: remote verification is inherently trust-based — a compromised server
+    can fake results. Hash spot-checks raise the bar for undetected tampering."""
     total_to_check = len(entries) + len(link_map)
     print(f"\n  {C.DIM}Verifying {total_to_check} files on remote...{C.RESET}", end="", flush=True)
 
@@ -2036,7 +2038,22 @@ def verify_copy_remote(ssh, entries, link_map, remote_root):
 
     total_checked = total_to_check
 
-    if not missing and not mismatches:
+    # Hash spot-check: verify a sample of files by hashing on remote
+    hash_failures = []
+    if not missing and not mismatches and entries:
+        hashed_entries = [e for e in entries if e.content_hash]
+        if hashed_entries:
+            import random
+            sample_size = min(20, len(hashed_entries))
+            sample = random.sample(hashed_entries, sample_size)
+            sample_rels = [e.rel for e in sample]
+            remote_hashes = remote_hash_files(ssh, remote_root, sample_rels)
+            for e in sample:
+                rh = remote_hashes.get(e.rel)
+                if rh and e.content_hash and rh != e.content_hash:
+                    hash_failures.append(e.rel)
+
+    if not missing and not mismatches and not hash_failures:
         print(f"\r  {C.GREEN}✓ Verified: all {total_checked} files OK on remote{C.RESET}               ")
         return True
     else:
@@ -2045,8 +2062,10 @@ def verify_copy_remote(ssh, entries, link_map, remote_root):
             print(f"    {C.RED}MISSING: {m}{C.RESET}")
         for rel, exp, act in mismatches[:10]:
             print(f"    {C.RED}SIZE MISMATCH: {rel} ({exp} → {act}){C.RESET}")
-        shown = min(len(missing), 10) + min(len(mismatches), 10)
-        remain = len(missing) + len(mismatches) - shown
+        for rel in hash_failures[:10]:
+            print(f"    {C.RED}HASH MISMATCH: {rel}{C.RESET}")
+        shown = min(len(missing), 10) + min(len(mismatches), 10) + min(len(hash_failures), 10)
+        remain = len(missing) + len(mismatches) + len(hash_failures) - shown
         if remain > 0:
             print(f"    ... and {remain} more")
         return False
@@ -2377,11 +2396,14 @@ def copy_individual_remote_to_local(entries, ssh, dst_root, progress, buf_size):
 class _ProgressTarExtractor:
     """Extract tar members with byte-level progress for large files."""
 
-    def __init__(self, tar, dst_root, progress):
+    def __init__(self, tar, dst_root, progress, allowed_files=None):
         self._tar = tar
         self._dst_root = dst_root
         self._progress = progress
         self.extracted = 0
+        self.rejected = 0
+        # If provided, only extract files in this set (prevents injection)
+        self._allowed = set(allowed_files) if allowed_files else None
 
     # Maximum bytes to extract from a single tar member (50 GB safety limit)
     MAX_MEMBER_SIZE = 50 * 1024 * 1024 * 1024
@@ -2401,6 +2423,11 @@ class _ProgressTarExtractor:
         check = _validate_tar_member(member, self._dst_root)
         if check is not True:
             return check
+
+        # Reject files not in the expected allowlist (prevents injection)
+        if self._allowed is not None and member.name not in self._allowed:
+            self.rejected += 1
+            return "blocked: unexpected file (not in transfer list)"
 
         # Empty or small file — extract normally, update after
         if member.size < 1 * 1024 * 1024:
@@ -2483,7 +2510,8 @@ def _stream_tar_batch_from_remote(batch, ssh, src_root, dst_root, progress):
     extracted = 0
     try:
         with tarfile.open(fileobj=reader, mode="r|") as tar:
-            extractor = _ProgressTarExtractor(tar, dst_root, progress)
+            allowed = [e.rel for e in batch]
+            extractor = _ProgressTarExtractor(tar, dst_root, progress, allowed_files=allowed)
             for member in tar:
                 try:
                     result = extractor.extract_member(member)
@@ -2492,6 +2520,9 @@ def _stream_tar_batch_from_remote(batch, ssh, src_root, dst_root, progress):
                 except (OSError, tarfile.TarError) as e:
                     print(f"\n  {C.YELLOW}Extract error: {member.name}: {e}{C.RESET}")
             extracted = extractor.extracted
+            if extractor.rejected > 0:
+                print(f"\n  {C.RED}WARNING: {extractor.rejected} unexpected files "
+                      f"rejected from remote tar stream (possible injection){C.RESET}")
     except (OSError, tarfile.TarError) as e:
         print(f"\n  {C.RED}Tar extraction failed: {e}{C.RESET}")
     finally:
@@ -2641,14 +2672,21 @@ def _stream_tar_batch_r2r(batch, src_ssh, dst_ssh, src_root, dst_root, progress)
         f"tar xf - --no-same-owner --no-same-permissions -C {shlex.quote(dst_root)}"
     )
 
-    # Relay: src → dst
+    # Relay: src → dst (with size limit to prevent source sending infinite data)
+    # Allow 3x the expected batch size for tar overhead
+    expected_size = sum(e.size for e in safe_entries)
+    max_relay = max(expected_size * 3, 100 * 1024 * 1024)  # at least 100 MB
     relayed = 0
     while True:
         data = src_chan.recv(1048576)
         if not data:
             break
-        dst_chan.sendall(data)
         relayed += len(data)
+        if relayed > max_relay:
+            print(f"\n  {C.RED}WARNING: Source tar stream exceeded expected size "
+                  f"({fmt_size(relayed)} > {fmt_size(max_relay)}) — aborting relay{C.RESET}")
+            break
+        dst_chan.sendall(data)
 
     dst_chan.shutdown_write()
     sender.join(timeout=10)

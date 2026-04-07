@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.4.4 — 2026-04-07
+
+### Bug Fixes
+- **R2R incremental hash fix** — Remote-to-remote incremental mode now correctly hashes source files on the remote machine instead of trying to open remote paths locally, which caused unnecessary recopying of same-size files
+- **DedupDB connection leak fix** — SQLite connection is now properly closed if schema initialization fails during `DedupDB.__init__`
+- **Progress display data race** — `Progress.display()` now reads counters under the lock, eliminating a thread-safety issue on non-CPython runtimes
+
+### Security Fixes
+- **Self-update URL validation** — Downloads now verify the URL is HTTPS from expected GitHub domains (`github.com`, `objects.githubusercontent.com`) and that SSL certificate verification is active before downloading
+- **DedupDB symlink TOCTOU fix** — Replaced check-then-open with `O_NOFOLLOW` atomic open (Linux/macOS) to eliminate the race window between symlink check and SQLite connect
+- **R2R symlink cleanup fallback** — Post-relay symlink removal now works on destinations without `python3` by falling back to `find -type l -delete`
+
+### Improvements
+- **Log entries freed after write** — `_log_entries` list is now cleared after `write_log_file()` writes to disk, releasing memory for large copies
+- **Reduced memory retention** — The full scan entries list is no longer retained through the entire local copy flow; only the precomputed total size is kept for the summary
+
 ## v2.4.3 — 2026-04-05
 
 ### New Features

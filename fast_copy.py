@@ -100,7 +100,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ════════════════════════════════════════════════════════════════════════════
 # VERSION
 # ════════════════════════════════════════════════════════════════════════════
-__version__ = "2.4.3"
+__version__ = "2.4.4"
 GITHUB_REPO = "gekap/fast-copy"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -137,10 +137,11 @@ def write_log_file(path, summary):
     log = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "summary": summary,
-        "files": _log_entries,
+        "files": list(_log_entries),
     }
     with open(path, "w") as f:
         json.dump(log, f, indent=2)
+    _log_entries.clear()
     print(f"  Log:     {C.BOLD}{path}{C.RESET}")
 
 
@@ -319,20 +320,33 @@ class DedupDB:
         self.db_path = db_path
         # Prefix to convert dest-relative → mount-relative
         self._prefix = os.path.relpath(self.dst_root, self.mount)
-        # Reject if db_path is a symlink (prevents symlink attack to write elsewhere)
-        if os.path.islink(db_path):
+        # Reject if db_path is a symlink — use O_NOFOLLOW to avoid TOCTOU race
+        if hasattr(os, 'O_NOFOLLOW'):
+            try:
+                fd = os.open(db_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                os.close(fd)
+            except OSError as e:
+                import errno
+                if e.errno in (errno.ELOOP, errno.EMLINK):
+                    raise OSError(f"Refusing to open dedup DB: {db_path} is a symlink")
+                raise
+        elif os.path.islink(db_path):
             raise OSError(f"Refusing to open dedup DB: {db_path} is a symlink")
-        # Create DB with restrictive permissions (owner-only) to avoid race
+        # Create DB with restrictive permissions (owner-only)
         old_umask = os.umask(0o077)
         try:
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
         finally:
             os.umask(old_umask)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")  # WAL default, crash-safe
-        self.conn.execute("PRAGMA user_version=4718")  # schema v2
-        self.lock = threading.Lock()
-        self._init_schema()
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")  # WAL default, crash-safe
+            self.conn.execute("PRAGMA user_version=4718")  # schema v2
+            self.lock = threading.Lock()
+            self._init_schema()
+        except Exception:
+            self.conn.close()
+            raise
 
     def _mount_rel(self, rel_path):
         """Convert destination-relative path to mount-relative path.
@@ -923,8 +937,10 @@ def remote_hash_files(ssh, remote_root, rel_paths):
     return result
 
 
-def filter_unchanged_remote(entries, link_map, ssh, remote_root):
-    """Incremental check against remote. Uses manifest or find+hash."""
+def filter_unchanged_remote(entries, link_map, ssh, remote_root,
+                            src_ssh=None, src_root=None):
+    """Incremental check against remote. Uses manifest or find+hash.
+    For R2R mode, pass src_ssh/src_root to hash source files on the remote."""
     print(f"  {C.DIM}Checking remote for existing files...{C.RESET}", end="", flush=True)
 
     # Try manifest first (instant), fall back to find
@@ -965,14 +981,19 @@ def filter_unchanged_remote(entries, link_map, ssh, remote_root):
     if need_hash:
         print(f"  {C.DIM}Hashing {len(need_hash)} files on remote...{C.RESET}", end="", flush=True)
         remote_h = remote_hash_files(ssh, remote_root, [e.rel for e in need_hash])
+        # Hash source files: on remote source (R2R) or locally (L2R)
+        if src_ssh and src_root:
+            src_h = remote_hash_files(src_ssh, src_root, [e.rel for e in need_hash])
+        else:
+            src_h = None
         for entry in need_hash:
             rh = remote_h.get(entry.rel)
-            # Remote used sha256, local may have xxh128 — compare if same algo
-            # For cross-algo: re-hash locally with sha256 for comparison
             if rh and entry.content_hash:
-                # If hashes match (same algo) skip; otherwise must copy
-                # Since remote always uses sha256, re-hash source with sha256
-                local_sha = hash_file_sha256(entry.src)
+                # Get source sha256: from remote source (R2R) or local file (L2R)
+                if src_h is not None:
+                    local_sha = src_h.get(entry.rel)
+                else:
+                    local_sha = hash_file_sha256(entry.src)
                 if local_sha == rh:
                     _log("skipped", entry.rel, entry.size, reason="unchanged")
                     skipped.append(entry)
@@ -1733,9 +1754,13 @@ class Progress:
         if elapsed < 0.01:
             return
 
-        pct = (self.bytes_done / self.total_bytes * 100) if self.total_bytes else 100
-        speed = self.bytes_done / elapsed
-        eta = (self.total_bytes - self.bytes_done) / speed if speed > 0 else 0
+        with self.lock:
+            bytes_done = self.bytes_done
+            files_done = self.files_done
+
+        pct = (bytes_done / self.total_bytes * 100) if self.total_bytes else 100
+        speed = bytes_done / elapsed
+        eta = (self.total_bytes - bytes_done) / speed if speed > 0 else 0
 
         bar_w = 30
         filled = int(bar_w * min(pct, 100) / 100)
@@ -1743,9 +1768,9 @@ class Progress:
 
         sys.stdout.write(
             f"\r  {C.CYAN}{bar}{C.RESET} {pct:5.1f}%  "
-            f"{fmt_size(self.bytes_done)}/{fmt_size(self.total_bytes)}  "
+            f"{fmt_size(bytes_done)}/{fmt_size(self.total_bytes)}  "
             f"{C.GREEN}{fmt_speed(speed)}{C.RESET}  "
-            f"{self.files_done}/{self.total_files} files  "
+            f"{files_done}/{self.total_files} files  "
             f"ETA {fmt_time(eta)}   "
         )
         sys.stdout.flush()
@@ -3005,12 +3030,6 @@ def _stream_tar_batch_r2r(batch, src_ssh, dst_ssh, src_root, dst_root, progress)
     # Safety check: remove any symlinks the source may have injected
     # (GNU tar strips leading '/' but cannot prevent '..' or symlink members)
     if dst_ssh.caps.get("python3"):
-        allowed_set = set(e.rel for e in safe_entries)
-        # Also allow parent directories of allowed files
-        for e in safe_entries:
-            parts = e.rel.split("/")
-            for i in range(1, len(parts)):
-                allowed_set.add("/".join(parts[:i]))
         check_script = (
             'import os,sys,json\n'
             'dst=sys.argv[1]\n'
@@ -3031,6 +3050,20 @@ def _stream_tar_batch_r2r(batch, src_ssh, dst_ssh, src_root, dst_root, progress)
         if "REMOVED_SYMLINKS:" in out:
             removed = out.split("REMOVED_SYMLINKS:", 1)[1].strip()
             print(f"\n  {C.RED}WARNING: Removed symlinks injected by source: {removed}{C.RESET}")
+    else:
+        # Fallback: use find -type l to remove symlinks (works without python3)
+        out, _, rc = dst_ssh.exec_cmd(
+            f"find {shlex.quote(dst_root)} -type l -print -delete 2>/dev/null",
+            timeout=60
+        )
+        if out.strip():
+            removed = [l.strip() for l in out.strip().split("\n") if l.strip()]
+            print(f"\n  {C.RED}WARNING: Removed {len(removed)} symlinks injected by "
+                  f"source:{C.RESET}")
+            for s in removed[:10]:
+                print(f"    {C.RED}{s}{C.RESET}")
+            if len(removed) > 10:
+                print(f"    ... and {len(removed) - 10} more")
 
     batch_size = sum(e.size for e in safe_entries)
     for e in safe_entries:
@@ -3495,11 +3528,27 @@ def self_update(target_version=None):
     # Download to a temporary file in the same directory (ensures same filesystem)
     tmp_path = self_path + ".update_tmp"
     try:
+        # Validate download URL comes from expected GitHub domains
+        from urllib.parse import urlparse
+        parsed = urlparse(download_url)
+        _ALLOWED_HOSTS = {"github.com", "objects.githubusercontent.com",
+                          "github-releases.githubusercontent.com"}
+        if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_HOSTS:
+            print(f"\n  {C.RED}Error: Unexpected download URL: {download_url}{C.RESET}")
+            print(f"  {C.RED}Expected HTTPS from GitHub domains{C.RESET}")
+            sys.exit(1)
+
         print(f"\n  Downloading...", end="", flush=True)
         req = urllib.request.Request(download_url, headers={
             "User-Agent": f"fast-copy/{__version__}",
         })
         ssl_ctx = _get_ssl_context()
+        # Ensure SSL certificate verification is active
+        import ssl as _ssl_mod
+        if ssl_ctx.verify_mode != _ssl_mod.CERT_REQUIRED:
+            print(f"\n  {C.RED}Error: SSL certificate verification is disabled — "
+                  f"refusing to download update{C.RESET}")
+            sys.exit(1)
         with urllib.request.urlopen(req, timeout=120, context=ssl_ctx) as resp:
             data = resp.read()
 
@@ -3867,7 +3916,8 @@ def main():
                 banner("Phase 2b — Remote incremental check")
                 try:
                     copy_entries, link_map, skipped_count, skipped_bytes = \
-                        filter_unchanged_remote(copy_entries, link_map, dst_ssh, dst)
+                        filter_unchanged_remote(copy_entries, link_map, dst_ssh, dst,
+                                                src_ssh=src_ssh, src_root=src)
                     unique_size = sum(e.size for e in copy_entries)
                 except Exception as e:
                     print(f"  {C.YELLOW}Incremental check failed ({e}) — copying all files{C.RESET}")
@@ -4353,14 +4403,14 @@ def main():
     # LOCAL FLOW
     # ══════════════════════════════════════════════════════════════════
     try:
-        _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
+        _run_local_flow(args, dst, copy_entries, link_map, total_size, dedup_db,
                         total_files, unique_size, saved_bytes, buf_size)
     finally:
         if dedup_db:
             dedup_db.close()
 
 
-def _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
+def _run_local_flow(args, dst, copy_entries, link_map, total_bytes, dedup_db,
                     total_files, unique_size, saved_bytes, buf_size):
     # ── Phase 2b: Skip unchanged files ────────────────────────────────
     skipped_count = 0
@@ -4381,7 +4431,7 @@ def _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
                     "source": args.source, "destination": dst,
                     "mode": "local_to_local", "total_files": total_files,
                     "copied": 0, "linked": 0, "skipped": skipped_count,
-                    "errors": 0, "total_bytes": sum(e.size for e in entries),
+                    "errors": 0, "total_bytes": total_bytes,
                     "bytes_written": 0, "dedup_saved": saved_bytes,
                     "elapsed_sec": 0, "avg_speed_bps": 0, "hash_algo": _hash_name,
                 })
@@ -4470,7 +4520,7 @@ def _run_local_flow(args, dst, copy_entries, link_map, entries, dedup_db,
             "total_files": total_files, "copied": len(copy_entries),
             "linked": len(link_map), "skipped": skipped_count,
             "errors": sum(1 for e in _log_entries if e["action"] == "error"),
-            "total_bytes": sum(e.size for e in entries),
+            "total_bytes": total_bytes,
             "bytes_written": unique_size,
             "dedup_saved": saved_bytes, "elapsed_sec": round(elapsed, 2),
             "avg_speed_bps": round(speed), "hash_algo": _hash_name,

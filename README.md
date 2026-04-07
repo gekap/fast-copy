@@ -88,6 +88,16 @@ When both source and destination are remote SSH servers, data relays through you
 
 The two servers do not need to reach each other directly. Data streams through in ~100 MB tar batches — your machine never stores the full dataset.
 
+## Platform Requirements
+
+| Platform | Minimum Version | Notes |
+|----------|----------------|-------|
+| **Windows** | Windows 7 SP1 | Pre-built binary compatible from **v2.4.5+** (built with Python 3.8). Releases v2.2.0–v2.4.4 require Windows 8.1+ |
+| **macOS** | macOS 10.13 (High Sierra) | Both ARM64 (Apple Silicon) and Intel x86_64 binaries provided |
+| **Linux** | Any with glibc 2.17+ | x86_64 binary; or run the Python script on any architecture |
+
+When running the Python script directly, Python 3.8 or later is required on all platforms.
+
 ## Installation
 
 ```bash

@@ -3,7 +3,7 @@
 ## v2.4.5 — 2026-04-07
 
 ### Bug Fixes
-- **Windows 7 compatibility** — Windows binary now builds with Python 3.8 (last version supporting Windows 7), fixing `api-ms-win-core-path-l1-1-0.dll` missing error on Windows 7/8 systems
+- **Windows 7/8 compatibility** — Windows binary now builds with Python 3.8 (last version supporting Windows 7), fixing `api-ms-win-core-path-l1-1-0.dll` missing error. Previous releases (v2.2.0–v2.4.4) required Windows 8.1+ because they were built with Python 3.11. Starting from this release, the Windows binary supports **Windows 7 SP1 and later**
 
 ## v2.4.4 — 2026-04-07
 
